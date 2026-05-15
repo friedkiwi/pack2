@@ -64,8 +64,16 @@ func TestReadAndExtractCompressedSample(t *testing.T) {
 		t.Fatalf("unpacked size = %d, want 683", file.UnpackedSize)
 	}
 
-	if _, err := archive.Extract(file); err == nil {
-		t.Fatal("expected compressed FTCOMP extraction to fail until the remaining static-table initialization mismatch is resolved")
+	out, err := archive.Extract(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadFile(filepath.Join("..", "..", "original", "examples", "EVALUATE.LIC"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(out, want) {
+		t.Fatalf("decompressed EVALUATE.LIC does not match OS/2 UNPACK2 output")
 	}
 }
 

@@ -233,7 +233,7 @@ func decodeCompressedBlock(block compressedBlock) ([]byte, int, error) {
 			return nil, 0, err
 		}
 	}
-	return out, br.pos, nil
+	return out, br.consumedBytes(), nil
 }
 
 func expandFramedIntermediate(intermediate []byte, version int) ([]byte, error) {
@@ -291,7 +291,7 @@ func buildAdaptiveTable(model []uint16, literalWeight, markerWeight byte) (*huff
 			if w == 0 {
 				continue
 			}
-			scaled := (int(w) * scale) >> 8
+			scaled := int(uint16(int(w)*scale) >> 8)
 			if scaled == 0 {
 				scaled = 1
 			}
@@ -301,45 +301,13 @@ func buildAdaptiveTable(model []uint16, literalWeight, markerWeight byte) (*huff
 	return buildHuffTable(weights)
 }
 
-type mtfPair struct {
-	recent0 int
-	recent1 int
-}
-
-func (m *mtfPair) decode(value int, version int) int {
-	if value == 0x100 {
-		return m.recent0
-	}
-	if version == Version2 && value == 0x101 {
-		return m.recent1
-	}
-	if m.recent1 < m.recent0 {
-		if m.recent1 <= value {
-			value++
-		}
-		if m.recent0 <= value {
-			value++
-		}
-	} else {
-		if m.recent0 <= value {
-			value++
-		}
-		if m.recent1 <= value {
-			value++
-		}
-	}
-	m.recent1 = m.recent0
-	m.recent0 = value
-	return value
-}
-
 func decodeIntermediate(br *bitReader, tableA, tableB, suffixTable *huffTable, block compressedBlock) ([]byte, error) {
 	out := make([]byte, 0, block.intermediateTarget)
 	var twoByteHistory history
 	var markerHistory history
 	twoByteCursor := 0x20
 	markerCursor := 0x20
-	mtf := initialMTFState()
+	suffixState := newSuffixDecoderState()
 	subState := 0
 	pendingState := 0
 	pendingRecord := -1
@@ -347,14 +315,17 @@ func decodeIntermediate(br *bitReader, tableA, tableB, suffixTable *huffTable, b
 
 	for len(out) < block.intermediateTarget {
 		if pendingState != 0 {
-			nextState, err := appendSuffix(br, suffixTable, &out, mtf, pendingState, block.version, finalEstimate)
+			nextState, err := appendSuffix(br, suffixTable, &out, &suffixState, pendingState, finalEstimate, block.version)
 			if err != nil {
 				return nil, err
 			}
 			pendingState = nextState
 			if pendingState == 0 && pendingRecord >= 0 {
 				if pendingRecord+1 < len(out) {
-					finalEstimate += markerLengthEstimate(out[pendingRecord+1], out[pendingRecord+2:])
+					control := out[pendingRecord+1]
+					if markerControlClass[control] >= 3 {
+						finalEstimate += markerLengthEstimate(control, out[pendingRecord+2:])
+					}
 				}
 				pendingRecord = -1
 			}
@@ -395,6 +366,9 @@ func decodeIntermediate(br *bitReader, tableA, tableB, suffixTable *huffTable, b
 			} else {
 				pendingRecord = controlOffset - 1
 				markerHistory.insert(&markerCursor, uint16(controlOffset))
+				if pendingState < 3 {
+					finalEstimate += markerLengthEstimate(control, nil)
+				}
 			}
 		case sym <= 0x190:
 			distance := sym - 0x17f
@@ -437,9 +411,6 @@ func decodeIntermediate(br *bitReader, tableA, tableB, suffixTable *huffTable, b
 		}
 	}
 
-	if len(out) != block.intermediateTarget {
-		return nil, fmt.Errorf("%w: FTCOMP intermediate overflow", ErrInvalidData)
-	}
 	return out, nil
 }
 
@@ -471,84 +442,145 @@ func pairLengthEstimate(pair uint16) int {
 	return 2
 }
 
-func initialMTFState() []mtfPair {
-	mtf := make([]mtfPair, 4)
-	for i := range mtf {
-		mtf[i] = mtfPair{recent0: 0, recent1: 1}
-	}
-	return mtf
+type suffixDecoderState struct {
+	directByte          int
+	directByteSecondary int
+	wordClass           [3]int
+	wordClassSecondary  [3]int
+	longFinalByte       int
 }
 
-func appendSuffix(br *bitReader, table *huffTable, out *[]byte, mtf []mtfPair, state int, version int, finalEstimate int) (int, error) {
-	if state == 1 || state == 3 {
+func newSuffixDecoderState() suffixDecoderState {
+	return suffixDecoderState{
+		directByteSecondary: 1,
+		wordClassSecondary:  [3]int{1, 1, 1},
+	}
+}
+
+func appendSuffix(br *bitReader, table *huffTable, out *[]byte, state *suffixDecoderState, pending int, finalEstimate int, version int) (int, error) {
+	if pending == 1 {
 		value, err := table.decode(br)
 		if err != nil {
 			return 0, fmt.Errorf("decode FTCOMP suffix: %w", err)
 		}
-		value = mtf[0].decode(value, version)
+		value = decodeRankedSuffixValue(value, &state.directByte, &state.directByteSecondary, version)
 		*out = append(*out, byte(value))
-		if state == 3 {
-			return 2, nil
-		}
 		return 0, nil
 	}
 
-	suffixClass, low, err := readSuffixPrefix(br, finalEstimate)
-	if err != nil {
-		return 0, err
-	}
-	value, err := table.decode(br)
-	if err != nil {
-		return 0, fmt.Errorf("decode FTCOMP suffix: %w", err)
-	}
-	classIdx := suffixClass + 1
-	if classIdx >= len(mtf) {
-		classIdx = len(mtf) - 1
-	}
-	value = mtf[classIdx].decode(value, version)
-
-	var word int
-	switch suffixClass {
-	case 0:
-		word = ((value + 0x10) << 4) | low
-	case 1:
-		word = ((value + 0x44) << 6) | low
-	case 2:
-		if finalEstimate < 0x9100 {
-			word = ((value + 0x144) << 6) | low
-		} else {
-			word = ((value + 0x0a2) << 7) | low
+	if pending == 2 {
+		prefix, err := readSuffixPrefix(br, finalEstimate, version)
+		if err != nil {
+			return 0, err
 		}
-	default:
-		return 0, fmt.Errorf("%w: invalid suffix class", ErrInvalidData)
+		value, err := table.decode(br)
+		if err != nil {
+			return 0, fmt.Errorf("decode FTCOMP suffix: %w", err)
+		}
+		value = decodeRankedSuffixValue(value, &state.wordClass[prefix.class], &state.wordClassSecondary[prefix.class], version)
+
+		var word int
+		switch prefix.class {
+		case 0:
+			word = ((value + 0x10) << 4) | prefix.low
+		case 1:
+			word = ((value + 0x44) << 6) | prefix.low
+		case 2:
+			if prefix.narrowClass2 {
+				word = ((value + 0x144) << 6) | prefix.low
+			} else {
+				word = ((value + 0x0a2) << 7) | prefix.low
+			}
+		default:
+			return 0, fmt.Errorf("%w: invalid suffix class", ErrInvalidData)
+		}
+		*out = append(*out, byte(word), byte(word>>8))
+		return 0, nil
 	}
-	*out = append(*out, byte(word), byte(word>>8))
-	return 0, nil
+
+	if pending >= 3 && pending < 6 {
+		value, err := table.decode(br)
+		if err != nil {
+			return 0, fmt.Errorf("decode FTCOMP suffix: %w", err)
+		}
+		next := pending + 1
+		if next == 6 {
+			next = 0
+			if value == 0x100 {
+				value = state.longFinalByte
+			} else {
+				state.longFinalByte = value
+			}
+		} else {
+			if value == 0x100 {
+				value = 0
+			} else {
+				value++
+			}
+		}
+		*out = append(*out, byte(value))
+		return next, nil
+	}
+
+	return 0, fmt.Errorf("%w: invalid suffix state %d", ErrInvalidData, pending)
 }
 
-func readSuffixPrefix(br *bitReader, finalEstimate int) (class int, low int, err error) {
+func decodeRankedSuffixValue(value int, primary *int, secondary *int, version int) int {
+	if value == 0x100 {
+		return *primary
+	}
+	if version >= Version2 {
+		if value == 0x101 {
+			return *secondary
+		}
+		if *secondary < *primary {
+			if *secondary <= value {
+				value++
+			}
+			if *primary <= value {
+				value++
+			}
+		} else {
+			if *primary <= value {
+				value++
+			}
+			if *secondary <= value {
+				value++
+			}
+		}
+		*secondary = *primary
+	}
+	*primary = value
+	return value
+}
+
+type suffixPrefix struct {
+	class        int
+	low          int
+	narrowClass2 bool
+}
+
+func readSuffixPrefix(br *bitReader, finalEstimate int, version int) (suffixPrefix, error) {
 	buf, err := br.peek16()
 	if err != nil {
-		return 0, 0, err
+		return suffixPrefix{}, err
 	}
 	switch {
 	case buf&0x8000 == 0:
 		v, err := br.readBits(5)
-		return 0, int(v & 0x0f), err
+		return suffixPrefix{class: 0, low: int(v & 0x0f)}, err
+	case version >= Version2 && finalEstimate < 0x5100:
+		v, err := br.readBits(7)
+		return suffixPrefix{class: 1, low: int(v & 0x3f)}, err
 	case buf&0x4000 == 0:
-		if finalEstimate < 0x5100 {
-			v, err := br.readBits(7)
-			return 1, int(v & 0x3f), err
-		}
 		v, err := br.readBits(8)
-		return 1, int(v & 0x3f), err
+		return suffixPrefix{class: 1, low: int(v & 0x3f)}, err
+	case version >= Version2 && finalEstimate < 0x9100:
+		v, err := br.readBits(8)
+		return suffixPrefix{class: 2, low: int(v & 0x3f), narrowClass2: true}, err
 	default:
-		if finalEstimate < 0x9100 {
-			v, err := br.readBits(8)
-			return 2, int(v & 0x3f), err
-		}
 		v, err := br.readBits(9)
-		return 2, int(v & 0x7f), err
+		return suffixPrefix{class: 2, low: int(v & 0x7f)}, err
 	}
 }
 
@@ -572,7 +604,9 @@ func expandMarkerStream(src []byte, version int) ([]byte, error) {
 		escape = 0xff
 	}
 
-	dst := make([]byte, 0, len(src))
+	dst := make([]byte, len(presetDictionary), len(presetDictionary)+len(src))
+	copy(dst, presetDictionary)
+	base := len(dst)
 	for i := 0; i < len(src); {
 		b := src[i]
 		i++
@@ -631,7 +665,7 @@ func expandMarkerStream(src []byte, version int) ([]byte, error) {
 		}
 	}
 
-	return dst, nil
+	return dst[base:], nil
 }
 
 func expandRLE(src []byte) ([]byte, error) {

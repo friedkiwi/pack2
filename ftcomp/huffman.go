@@ -130,9 +130,9 @@ func buildHuffTable(weights []uint16) (*huffTable, error) {
 		nodeID := t.root
 		for nodeID >= internalNodeThreshold && nbits < fastBits {
 			if bits&0x8000 != 0 {
-				nodeID = t.nodes[nodeID/4].child1
-			} else {
 				nodeID = t.nodes[nodeID/4].child0
+			} else {
+				nodeID = t.nodes[nodeID/4].child1
 			}
 			bits <<= 1
 			nbits++
@@ -144,31 +144,31 @@ func buildHuffTable(weights []uint16) (*huffTable, error) {
 	return t, nil
 }
 
-func sortQueueDOS(queue []uint16, first, last int, t *huffTable) {
-	if first >= last {
+func sortQueueDOS(queue []uint16, low, high int, t *huffTable) {
+	if low >= high {
 		return
 	}
 
 	type span struct {
-		left  int
-		right int
+		low  int
+		high int
 	}
-	stack := []span{{left: first, right: last}}
+	stack := []span{{low: low, high: high}}
 	for len(stack) > 0 {
 		n := len(stack) - 1
-		left := stack[n].left
-		right := stack[n].right
+		low := stack[n].low
+		high := stack[n].high
 		stack = stack[:n]
 
 		for {
-			if right-left <= 16 {
-				insertionSortQueueDOS(queue, left, right, t)
+			if high-low <= 16 {
+				insertionSortQueueDOS(queue, low, high, t)
 				break
 			}
 
-			i := left
-			j := right
-			pivot := t.nodes[queue[(left+right)/2]/4].weight
+			i := low
+			j := high
+			pivot := t.nodes[queue[(low+high)/2]/4].weight
 			for {
 				for t.nodes[queue[i]/4].weight < pivot {
 					i++
@@ -186,20 +186,20 @@ func sortQueueDOS(queue []uint16, first, last int, t *huffTable) {
 				}
 			}
 
-			leftSize := j - left
-			rightSize := right - i
+			leftSize := j - low
+			rightSize := high - i
 			if rightSize > leftSize {
-				if i < right {
-					stack = append(stack, span{left: i, right: right})
+				if i < high {
+					stack = append(stack, span{low: i, high: high})
 				}
-				right = j
+				high = j
 			} else {
-				if left < j {
-					stack = append(stack, span{left: left, right: j})
+				if low < j {
+					stack = append(stack, span{low: low, high: j})
 				}
-				left = i
+				low = i
 			}
-			if left >= right {
+			if low >= high {
 				break
 			}
 		}
@@ -237,9 +237,9 @@ func (t *huffTable) decode(br *bitReader) (int, error) {
 			return 0, err
 		}
 		if bit != 0 {
-			nodeID = t.nodes[nodeID/4].child1
-		} else {
 			nodeID = t.nodes[nodeID/4].child0
+		} else {
+			nodeID = t.nodes[nodeID/4].child1
 		}
 	}
 

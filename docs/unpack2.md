@@ -57,7 +57,8 @@ The FTCOMP implementation inside this OS/2 binary maps to [FTCOMP Compression No
 | `0x008a7c` | `ftcomp_sort_model_symbols(...)` | Non-stable model-symbol sorter used by the builder. |
 | `0x00a69c` | `ftcomp_expand_framed_intermediate(...)` | Reads `uint16 segment_len` frames from the intermediate stream. |
 | `0x00a622` | `ftcomp_expand_segment_to_output(...)` | Handles segment mode byte and dispatches marker expansion. |
-| `0x00993e` | `ftcomp_expand_marker_stream(...)` | Expands `0x9e` marker records to final output bytes. |
+| `0x0075fe` | `ftcomp_expand_marker_stream(...)` | Expands `0x9e` marker records to final output bytes. |
+| `0x00993e` | `ftcomp_build_marker_model_and_encode_block(...)` | Producer-side/model-building path, not the simple marker expander. |
 | `0x0078ee` | `fast_fmemcpy(uint16_t len, void far *src, void far *dst)` | Far memory copy helper; confirms argument order used in the notes. |
 | `0x00787e` | `far_memset(void far *dst, int value, uint16_t len)` | Far memory fill helper. |
 

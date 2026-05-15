@@ -15,15 +15,19 @@ func newBitReader(data []byte) *bitReader {
 
 func (b *bitReader) fill() error {
 	for b.nb <= 8 {
-		if b.pos >= len(b.data) {
-			b.nb += 8
-			continue
-		}
-		b.buf |= uint16(b.data[b.pos]) << (8 - b.nb)
-		b.pos++
-		b.nb += 8
+		b.appendByte()
 	}
 	return nil
+}
+
+func (b *bitReader) appendByte() {
+	if b.pos >= len(b.data) {
+		b.nb += 8
+		return
+	}
+	b.buf |= uint16(b.data[b.pos]) << (8 - b.nb)
+	b.pos++
+	b.nb += 8
 }
 
 func (b *bitReader) peek16() (uint16, error) {
@@ -41,9 +45,7 @@ func (b *bitReader) readBits(n int) (uint16, error) {
 		return 0, nil
 	}
 	for b.nb < n {
-		if err := b.fill(); err != nil {
-			return 0, err
-		}
+		b.appendByte()
 	}
 	v := b.buf >> (16 - n)
 	b.buf <<= n
@@ -54,4 +56,8 @@ func (b *bitReader) readBits(n int) (uint16, error) {
 func (b *bitReader) consume(n int) error {
 	_, err := b.readBits(n)
 	return err
+}
+
+func (b *bitReader) consumedBytes() int {
+	return b.pos - b.nb/8
 }

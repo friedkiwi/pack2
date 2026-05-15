@@ -63,7 +63,8 @@ The attached OS/2 `UNPACK2.EXE` IDB currently maps to these FTCOMP concepts:
 | Model sorter | `ftcomp_sort_model_symbols` | `0x008a7c` | Non-stable quicksort/insertion-sort helper for model symbols. |
 | Framed intermediate pass | `ftcomp_expand_framed_intermediate` | `0x00a69c` | Reads `uint16 segment_len` records from the intermediate stream. |
 | Segment expansion | `ftcomp_expand_segment_to_output` | `0x00a622` | Treats byte zero of each segment as the mode byte. |
-| Marker expansion | `ftcomp_expand_marker_stream` | `0x00993e` | Expands `0x9e` marker records. |
+| Marker expansion | `ftcomp_expand_marker_stream` | `0x0075fe` | Expands `0x9e` marker records. |
+| Marker-model encoder | `ftcomp_build_marker_model_and_encode_block` | `0x00993e` | Producer-side/model-building path, not the simple marker expander. |
 | Far copy helper | `fast_fmemcpy` | `0x0078ee` | Signature is `fast_fmemcpy(len, src, dst)`. |
 
 ### OS/2 UNPACK2 Data Anchors
@@ -178,6 +179,14 @@ Observed field usage:
 - The bitstream starts at block offset `6`.
 - `compressed_bytes_consumed` is computed from the internal input cursor after decoding, plus the 4-byte stream tag at the top level.
 
+The compressed-byte count is corrected for whole bytes that were prefetched into the bit buffer but not consumed:
+
+```c
+compressed_bytes_consumed = input_cursor - (bits_available / 8);
+```
+
+The OS/2 block decoder confirms this at `0x98f8..0x98fd`: it shifts the remaining bit count down by three and subtracts that count from the byte cursor before returning.
+
 The OS/2 `UNPACK2` block decoder at `0x0091aa` confirms this layout directly. On the compressed path it stores:
 
 ```text
@@ -255,12 +264,19 @@ while (bits_available <= 8) {
 To consume `n` bits:
 
 ```c
+while (bits_available < n) {
+    bitbuf |= next_byte << (8 - bits_available);
+    bits_available += 8;
+}
+
 value = top n bits of bitbuf;
 bitbuf <<= n;
 bits_available -= n;
 ```
 
 The Huffman fast path indexes tables with the top 9 bits of the 16-bit bit buffer.
+
+Do not use the `<= 8` refill rule inside the slow one-bit Huffman walk. OS/2 appends exactly one byte only when the slow path has no available bits left; prefetching a second byte there changes the byte cursor and the returned consumed count.
 
 ## Huffman Tables
 
@@ -339,10 +355,12 @@ The 8-byte node records at `0x528e` and in the snapshots are:
 struct huff_node {
     uint16_t weight;       // scaled frequency/weight
     uint16_t parent;       // parent node id, or 0 while unlinked
-    uint16_t child0;       // left/zero child for internal nodes
-    uint16_t child1;       // right/one child for internal nodes
+    uint16_t child0;       // first merged child for internal nodes
+    uint16_t child1;       // second merged child for internal nodes
 };
 ```
+
+The child names are descriptive only. The OS/2 decoder's bit polarity is easy to read backwards: a set input bit selects the first merged child (`child0`), and a clear input bit selects the second merged child (`child1`).
 
 Node ids are stored as byte offsets into the node table, not as dense indexes. Leaf symbol `n` has node id `n * 4`. Internal node ids start at `0x06c4`, which is `433 * 4`.
 
@@ -427,21 +445,13 @@ marker_control_class[256] =
 
 ```text
 symbol_class[433] =
-0000000000000000000000000000000000000000000000000000000000000000
-0000000000000000000000000000000000000000000000000000000000000000
-0000000000000000000000000000000000000000000000000000000000000000
-0000000000000000000000000000000000000000000000000000000000000000
-0000000000000000000000000000000000000000000000000000000000000000
-0000000000000000000000000000000000000000000000000000000000000000
-0000000000000000000000000000000000000000000000000000000000000000
-0000000000000000000000000000000000000000000000000000000000000000
-0000000000000101010101010101010101010101010101010101010101010101
-0101010101010101010101010101010101010101010101010101010101010101
-0101010101010001010101010101010101010101010101010101010101010101
-0101010101010101010101010101010101010101010101010101010101010101
-0101010101010100000000000000000000000000000000000000000000000000
-0000000000000001010101010101010101
+0x000..0x0ff = 0
+0x100..0x180 = 1
+0x181..0x1a0 = 0
+0x1a1..0x1b0 = 1
 ```
+
+This table is an easy source of a false first-frame failure. The explicit marker symbols begin at `0x100`, not `0x108`; the two-byte pair/history symbols `0x181..0x1a0` are class zero; marker-history replay symbols `0x1a1..0x1b0` are class one. A QEMU trace of DOS `UNPACK2` at the first-stage return point confirmed this table directly from runtime address `DS:0x14f2`.
 
 ```text
 static_model_seed_weights_le16[433] =
@@ -641,9 +651,9 @@ for prefix = 0; prefix < 512; prefix++ {
 
     while node_id >= 0x06c4 && nbits < 9 {
         if (bits & 0x8000)
-            node_id = node[node_id / 4].child1;
-        else
             node_id = node[node_id / 4].child0;
+        else
+            node_id = node[node_id / 4].child1;
         bits <<= 1;
         nbits++;
     }
@@ -689,12 +699,14 @@ if (max_weight > 0xff) {
     scale = 0xffff / max_weight;
     for each node weight {
         old = weight;
-        weight = (weight * scale) >> 8;
+        weight = low16(weight * scale) >> 8;
         if (old != 0 && weight == 0)
             weight = 1;
     }
 }
 ```
+
+The `low16` detail follows the 16-bit OS/2 code: the multiply instruction leaves the low 16-bit product in `AX`, then the scaler stores `AH` as the new byte-sized weight. A clean implementation should not use the high bits of the full mathematical product, even though the selected scale normally keeps the product inside 16 bits.
 
 The generated first table is saved:
 
@@ -798,14 +810,28 @@ The OS/2 `UNPACK2` binary has the same framing post-pass: after the first-stage 
 
 The OS/2 `PACK2` utility's embedded decode path follows the same structure, which gives a second confirmation that framing is part of FTCOMP itself rather than an artifact of one executable.
 
-If segment framing is implemented but the first `segment_len` is larger than the remaining intermediate buffer, the mismatch is earlier than marker expansion. For `EVALUATE.LI_`, errors such as `truncated intermediate segment at offset 0 length 31224 remaining 481`, `truncated intermediate segment at offset 0 length 51192 remaining 481`, or `truncated intermediate segment at offset 0 length 36088 remaining 481` mean the first two intermediate bytes were generated incorrectly. The most likely causes are:
+The first-stage block loop stops when the produced intermediate byte count is greater than or equal to `intermediate_target`. It does not treat a final suffix or two-byte replay that crosses the target by one byte as an immediate decoder error; the actual produced byte count is passed to the framing pass.
+
+If segment framing is implemented but the first `segment_len` is larger than the remaining intermediate buffer, the mismatch is earlier than marker expansion. For `EVALUATE.LI_`, errors such as `truncated intermediate segment at offset 0 length 31224 remaining 481`, `truncated intermediate segment at offset 0 length 51192 remaining 481`, `truncated intermediate segment at offset 0 length 36088 remaining 481`, or `truncated intermediate segment at offset 0 length 13129 remaining 482` mean the first two intermediate bytes were generated incorrectly. The most likely causes are:
 
 - using the primary adaptive table for pending suffix symbols instead of the generated `0x1aa4` suffix table,
 - trying to use the generated `0x1aa4` suffix table as the model decoder or primary decoder,
+- using a shifted `symbol_class` table when scaling adaptive weights; explicit marker symbols `0x100..0x180` must be class one,
 - skipping the tag-level static table initialization after seeing `fT19`,
 - copying the generated Huffman tables in the wrong direction because of misleading `fast_fmemcpy` argument comments,
 - diverging from the exact in-place `build_huffman_decode_tables` merge loop. In particular, a builder that repeatedly removes two queue entries and reinserts one parent is not equivalent to the DOS queue mutation order documented above,
 - or using stable sorting for equal-weight Huffman leaves. The DOS sorter is not stable; changing only this ordering has been observed to change the `EVALUATE.LI_` intermediate prefix.
+
+The DOS binary has been validated as a runtime oracle under FreeDOS in QEMU. Running `UNPACK2` against `original/examples/EVALUATE.LI_` produces `EVALUATE.LIC` byte-for-byte equal to the checked-in decompressed sample. This confirms the fixture and the unpacked DOS binary, and rules out Wine/host-execution artifacts.
+
+A targeted Huffman variant sweep against this fixture ruled out several tempting fixes:
+
+- Swapping the two adaptive table selections changes the prefix but still produces an invalid first frame.
+- Swapping the first or second block weight pair changes the prefix but still produces an invalid first frame.
+- Changing parent insertion to occur after equal weights can produce a superficially plausible first segment length (`0x00fb` or `0x00e9`), but the segment mode/data are invalid and the following segment length is impossible.
+- Reversing child order or using stable whole-queue sorting diverges even earlier.
+
+The DOS `build_huffman_decode_tables` merge loop stops parent insertion at the first queued node whose weight is greater than or equal to the new parent weight. That matches the current documented queue rule; the plausible-frame result from "insert after equal" is a false lead, not an IBM-compatible fix.
 
 Within a marker-expanded segment, `segment_data` contains literal bytes and `0x9e` marker records.
 
@@ -837,9 +863,9 @@ consume(nbits);
 while (symbol_node >= 0x06c4) {
     bit = read_bit();
     if (bit)
-        symbol_node = node[symbol_node / 4].child1;
-    else
         symbol_node = node[symbol_node / 4].child0;
+    else
+        symbol_node = node[symbol_node / 4].child1;
 }
 
 symbol = symbol_node >> 2;
@@ -934,14 +960,66 @@ promote_history(history, cursor, idx, value):
 
 Some explicit marker controls need extra bytes after the control byte. `UNPACK2` stores this in the high byte of a local state word. The suffix decoder runs before returning to normal primary-symbol mode.
 
-The suffix decoder first reads a small raw prefix from the bitstream. It returns:
+The OS/2 `UNPACK2` block decoder implements the suffix paths inline in `ftcomp_expand_block_to_buffer`:
 
 ```text
-suffix_low_bits  // called var_C in IDA
-suffix_class     // called var_14 in IDA; values 0, 1, or 2
+0x934b..0x951f  pending states 1 and 2
+0x9526..0x95e7  pending states 3, 4, and 5
 ```
 
-For the normal `fT19` path:
+These pending states come from `marker_control_class[control]` after an explicit marker control byte:
+
+| Control range | Initial pending state | Suffix bytes appended | Marker form |
+| --- | ---: | ---: | --- |
+| `0x00..0x3f` | `1` | 1 | Short marker: one encoded distance byte. |
+| `0x40..0x7f` | `2` | 2 | Medium marker: one encoded distance word. |
+| `0x80` | `3` | 3 | Long marker: one length byte and one distance word. |
+| other controls | `0` | 0 | Marker record is complete. |
+
+#### Pending State 1: Direct Suffix Byte
+
+Pending state `1` decodes one symbol from the tag-level static suffix table generated from the `tagged_model_seed_weights_le16` constants. It does not read a raw prefix and does not use the per-block adaptive tables.
+
+OS/2 address anchors:
+
+```text
+0x934b..0x935f  dispatch state 1
+0x9425..0x948c  decode one tagged suffix symbol
+0x9493..0x94b4  direct-byte reuse/update and emit
+```
+
+The decoded symbol has one remembered value:
+
+```c
+value = decode_tagged_suffix_symbol();
+
+if (value == 0x100) {
+    value = recent_direct_byte;
+} else {
+    recent_direct_byte = value;
+}
+
+emit byte(value);
+pending_state = 0;
+```
+
+The OS/2 implementation initializes this remembered value to zero at the start of the compressed block.
+
+#### Pending State 2: Encoded Distance Word
+
+Pending state `2` first reads a raw prefix from the bitstream, then decodes one symbol from the tag-level static suffix table. OS/2 `UNPACK2` uses fixed prefix sizes in this path; no output-size thresholds are present in `0x9366..0x93e5`.
+
+The DOS `UNPACK2` binary contains an additional thresholded path at raw addresses `0x3cc2..0x3d65` (IDA rebased `0x13cc2..0x13d65`). This path checks the 32-bit final-output estimate at `0x82a4:0x82a6` before choosing class-1 and class-2 prefix widths. The thresholded DOS path is version/output-size dependent; it must not be collapsed into the OS/2 `fT19` fixed path.
+
+OS/2 address anchors:
+
+```text
+0x9366..0x93e5  raw prefix decode
+0x93ea..0x948c  tagged suffix symbol decode
+0x94b6..0x951f  class-specific reuse/update, word construction, and emit
+```
+
+Prefix decode:
 
 ```c
 if ((bitbuf & 0x8000) == 0) {
@@ -950,81 +1028,33 @@ if ((bitbuf & 0x8000) == 0) {
     consume(5);
 } else if ((bitbuf & 0x4000) == 0) {
     suffix_class = 1;
-    if (bytes_produced_so_far < 0x5100) {
-        suffix_low_bits = (bitbuf >> 9) & 0x3f;
-        consume(7);
-    } else {
-        suffix_low_bits = (bitbuf >> 8) & 0x3f;
-        consume(8);
-    }
+    suffix_low_bits = (bitbuf >> 8) & 0x3f;
+    consume(8);
 } else {
     suffix_class = 2;
-    if (bytes_produced_so_far < 0x9100) {
-        suffix_low_bits = (bitbuf >> 8) & 0x3f;
-        consume(8);
-    } else {
-        suffix_low_bits = (bitbuf >> 7) & 0x7f;
-        consume(9);
-    }
+    suffix_low_bits = (bitbuf >> 7) & 0x7f;
+    consume(9);
 }
 ```
 
-There is a version-2 special case after control byte `0x40`: it sets a flag and uses a 2-bit prefix instead of the normal prefix tree.
-
-After the raw prefix, the decoder reads one symbol from the tag-level static suffix table generated from the `0x1aa4` seed weights. It does not use the per-block adaptive primary tables for this step. Symbols `0x100` and, for `fT21`, `0x101`, mean "reuse the most recent" and "reuse the second-most-recent" value for the current suffix class. Other values are adjusted upward so the aliases do not consume code space:
+Each class has one remembered suffix symbol, initialized to zero at the start of the compressed block:
 
 ```c
-decode_mtf(value, recent0, recent1):
-    if value == 0x100:
-        value = recent0;
-    else if version == fT21 && value == 0x101:
-        value = recent1;
-    else {
-        if (recent1 < recent0) {
-            if (recent1 <= value) value++;
-            if (recent0 <= value) value++;
-        } else {
-            if (recent0 <= value) value++;
-            if (recent1 <= value) value++;
-        }
-        recent1 = recent0;
-        recent0 = value;
-    }
-    return value;
-```
+value = decode_tagged_suffix_symbol();
 
-The DOS code has separate `recent0/recent1` pairs for:
+if (value == 0x100) {
+    value = recent_word_class[suffix_class];
+} else {
+    recent_word_class[suffix_class] = value;
+}
 
-- Literal suffix bytes.
-- Suffix class 0.
-- Suffix class 1.
-- Suffix class 2.
-- The version-2 special six-symbol rolling state.
-
-All of these pairs are initialized as:
-
-```text
-recent0 = 0
-recent1 = 1
-```
-
-Do not initialize them to space or `0xff`; those values come from unrelated fixed buffers in the decompressor state and will corrupt marker suffix bytes.
-
-### Suffix Word Encoding
-
-For marker suffix states other than the direct literal-byte state, the decoder appends a little-endian 16-bit word to the intermediate stream. The word is built from the decoded MTF value and the raw prefix:
-
-```c
 switch suffix_class {
 case 0:
     word = ((value + 0x10) << 4) | suffix_low_bits;
 case 1:
     word = ((value + 0x44) << 6) | suffix_low_bits;
 case 2:
-    if (bytes_produced_so_far < 0x9100)
-        word = ((value + 0x144) << 6) | suffix_low_bits;
-    else
-        word = ((value + 0x0a2) << 7) | suffix_low_bits;
+    word = ((value + 0x0a2) << 7) | suffix_low_bits;
 }
 
 emit low_byte(word);
@@ -1032,16 +1062,86 @@ emit high_byte(word);
 pending_state = 0;
 ```
 
-For the version-2 special control-`0x40` state:
+The thresholded class-1/class-2 decode previously described here is not present in the OS/2 `UNPACK2` `fT19` path. If that logic exists in another build or another version path, keep it separate from this OS/2-confirmed decoder.
+
+DOS thresholded variant:
 
 ```c
-word = ((value + 0x40) << 2) | suffix_low_bits;
-emit low_byte(word);
-emit high_byte(word);
-pending_state = 0;
+if ((bitbuf & 0x8000) == 0) {
+    suffix_class = 0;
+    suffix_low_bits = (bitbuf >> 11) & 0x0f;
+    consume(5);
+} else if (final_output_estimate < 0x5100) {
+    suffix_class = 1;
+    suffix_low_bits = (bitbuf >> 9) & 0x3f;
+    consume(7);
+} else if ((bitbuf & 0x4000) == 0) {
+    suffix_class = 1;
+    suffix_low_bits = (bitbuf >> 8) & 0x3f;
+    consume(8);
+} else if (final_output_estimate < 0x9100) {
+    suffix_class = 2;
+    suffix_low_bits = (bitbuf >> 8) & 0x3f;
+    consume(8);
+    word = ((value + 0x144) << 6) | suffix_low_bits;
+} else {
+    suffix_class = 2;
+    suffix_low_bits = (bitbuf >> 7) & 0x7f;
+    consume(9);
+    word = ((value + 0x0a2) << 7) | suffix_low_bits;
+}
 ```
 
-For the direct literal-byte suffix state, the decoded value also comes from the generated `0x1aa4` suffix table. The decoded value is emitted as one byte and the literal recent-value history is updated.
+For the `EVALUATE.LI_` fixture, enabling this DOS threshold path does not resolve the bad first frame header. The current mismatch occurs before marker expansion and before any useful conclusion can be drawn from the marker dictionary.
+
+#### Pending States 3, 4, and 5: Long Marker Suffix
+
+Pending state `3` is used by control byte `0x80`. It appends three bytes after the control byte. OS/2 handles this as a rolling state path:
+
+```text
+state 3 -> decode and emit byte 0, set state 4
+state 4 -> decode and emit byte 1, set state 5
+state 5 -> decode and emit byte 2, clear pending state
+```
+
+OS/2 address anchors:
+
+```text
+0x9526..0x95ba  decode one tagged suffix symbol
+0x95be..0x95e7  rolling-state transform and emit
+```
+
+Pseudocode:
+
+```c
+value = decode_tagged_suffix_symbol();
+pending_state++;
+
+if (pending_state == 6) {
+    pending_state = 0;
+
+    if (value == 0x100) {
+        value = recent_long_final_byte;
+    } else {
+        recent_long_final_byte = value;
+    }
+} else {
+    if (value == 0x100)
+        value = 0;
+    else
+        value++;
+}
+
+emit byte(value);
+```
+
+For a long marker record this means the first two suffix bytes use `0x100` as an alias for zero and all other decoded values are incremented by one. The third suffix byte uses one remembered value, also initialized to zero at compressed-block start.
+
+#### Tagged Suffix Table
+
+All three pending suffix paths above decode their Huffman symbol from the tag-level static suffix table generated from `tagged_model_seed_weights_le16`. They do not use the per-block adaptive primary tables.
+
+The two-entry MTF transform and output-size threshold rules previously inferred for this area do not match the loaded OS/2 `UNPACK2` implementation. Treat them as unconfirmed for FTCOMP until another binary path proves where they apply.
 
 ### Two-Byte History
 
@@ -1155,6 +1255,26 @@ expand_segment(segment):
 
 `ftcomp_expand_marker_stream` expands only the bytes after the mode flag.
 
+Important wrapper detail: the OS/2 segment expander does not expand into a zero-based scratch buffer. For the normal `fT19` mode-2 path it expands in place at offset `0xcfdc` in a preinitialized work segment. The bytes before that offset form a preset history window:
+
+```text
+0xbc62..0xbda1  0x140 bytes of 0x20
+0xbda2..0xbee1  0x140 bytes of 0xff
+0xbee2..0xc021  0x140 bytes of 0x00
+0xc022..0xcfdb  0x0fba bytes copied from the executable's fixed table
+0xcfdc          segment expansion starts here
+```
+
+The logical preset dictionary length is therefore `0x137a` bytes. Marker distances are checked against the absolute destination offset, so early marker records may legally copy from this preset window before any bytes from the current segment have been emitted. A clean implementation can model this by prepending the preset dictionary to the segment output during marker expansion, then returning only bytes appended after the preset dictionary.
+
+The complete standalone preset dictionary is included in [FTCOMP Preset Dictionary](ftcomp_preset_dictionary.hex.md). For `EVALUATE.LI_`, the first expanded segment begins:
+
+```text
+e1 01 01 5b 9e 44 31 0c ...
+```
+
+The first marker follows the literal `[` and has encoded distance `0x0c31`. It copies `License` from the preset window, which is why a zero-based marker expander fails with an invalid distance even when the Huffman stage is correct.
+
 Marker byte:
 
 ```text
@@ -1208,7 +1328,7 @@ Distance is therefore encoded as "distance minus one" in the stream.
 
 This pass is LZSS-like and must allow overlap during the copy.
 
-The destination is the current block-output window. A marker back-reference must resolve against bytes already emitted for the current segment/output window. A back-reference that points before the start of output is invalid; in practice, seeing that at marker offset `3` in `EVALUATE.LI_` indicates the segment frame was not stripped before marker expansion.
+The destination is the current block-output window plus the preset dictionary described above. A marker back-reference must resolve against bytes already available in that combined window. In a simplified decoder without the preset dictionary, early marker records from real PACK2 streams can look like invalid back-references even when they are valid for IBM `UNPACK2`.
 
 ## Version-2 RLE Pass
 
@@ -1347,7 +1467,6 @@ Validation strategy:
 These items are not yet fully confirmed:
 
 - The exact field name for `intermediate_target`; behavior says it bounds the first-stage intermediate output.
-- The remaining `EVALUATE.LI_` mismatch is still before marker expansion. With the documented second-pair weight order, MTF initialization, non-stable sorter, and in-place merge loop applied, the current generated intermediate prefix is `f8 8c 9e f8 0e 9e 2c 03 88 55 07 47 9e 74 ac 03`, which still decodes as an invalid first segment length. The next area to verify is exact static/model table construction against a trace from either the DOS implementation or the OS/2 `ftcomp_expand_block_to_buffer` path at `0x0091aa`.
 - The exact version-2 RLE side-stream split field name and all edge cases.
 
-The `EVALUATE.LI_` test case is `fT19`, so it does not require the version-2 RLE pass.
+The `EVALUATE.LI_` test case is `fT19`, so it does not require the version-2 RLE pass. It now decodes byte-for-byte to the DOS/OS2 `UNPACK2` output when the corrected `symbol_class` table and the preset marker dictionary are used.
