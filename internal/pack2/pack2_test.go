@@ -42,6 +42,37 @@ func TestReadAndExtractStoredSample(t *testing.T) {
 	}
 }
 
+func TestReadAndExtractCompressedSample(t *testing.T) {
+	f, err := os.Open(filepath.Join("..", "..", "original", "examples", "EVALUATE.LI_"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	archive, err := Read(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archive.Files) != 1 {
+		t.Fatalf("len(files) = %d, want 1", len(archive.Files))
+	}
+	file := archive.Files[0]
+	if file.Name != "EVALUATE.LIC" {
+		t.Fatalf("name = %q, want EVALUATE.LIC", file.Name)
+	}
+	if file.UnpackedSize != 683 {
+		t.Fatalf("unpacked size = %d, want 683", file.UnpackedSize)
+	}
+
+	out, err := archive.Extract(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int64(len(out)) != file.UnpackedSize {
+		t.Fatalf("len(out) = %d, want %d", len(out), file.UnpackedSize)
+	}
+}
+
 func TestPackReadExtractRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "hello.txt")

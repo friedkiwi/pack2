@@ -248,7 +248,7 @@ The DOS implementation stores FTCOMP state in global data. The names below are d
 | `0x73be` | `0x0400` | Snapshot of the first adaptive fast symbol table. |
 | `0x77be` | `0x0200` | Snapshot of the first adaptive fast length table. |
 | `0x79be` | `0x0362` | Per-block model weights, 433 `uint16` entries. |
-| `0x82aa` | `0x0060` | Recent marker-record offset history, 48 `uint16` slots. |
+| `0x82aa` | `0x0060` | Marker-record control-byte offset history, 48 `uint16` slots. |
 | `0x870e` | `0x0060` | Recent two-byte literal/history table, 48 `uint16` slots. |
 | `0x13f2` | `0x0100` | Marker-control class table indexed by marker control byte. |
 | `0x14f2` | `0x01b1` | Symbol class table; non-zero symbols use the second adaptive table. |
@@ -597,9 +597,47 @@ If `pending_state` is zero, the marker record is complete. If it is non-zero, la
 The decoder keeps two move-to-front histories:
 
 - A 48-entry two-byte history at `0x870e`.
-- A 48-entry marker-record offset history at `0x82aa`.
+- A 48-entry marker-record control-offset history at `0x82aa`.
 
-When a history symbol is used, the selected record is emitted and moved to the front by shifting the older entries right with `memmove`.
+These histories are not simple zero-based front-insert arrays. Each has a cursor:
+
+```text
+word_27A76  two-byte history cursor, initialized to 0x20
+word_27A74  marker history cursor, initialized to 0x20
+```
+
+Both history arrays are zero-filled when the block decoder starts. `UNPACK2` does not maintain a separate validity bitmap and does not reject unwritten slots; an unwritten history slot reads as offset/value zero.
+
+A history symbol indexes from the current cursor:
+
+```c
+slot = cursor + (symbol - history_base);
+```
+
+When a new entry is inserted from outside the history, the cursor is decremented and the entry is written at the new cursor. If the cursor underflows from zero, `UNPACK2` preserves the visible 16-entry window by copying slots `0..15` to slots `32..47`, then resets the cursor to `0x1f` before writing the new entry.
+
+```c
+insert_history(history, cursor, value):
+    old = cursor;
+    cursor--;
+
+    if old == 0 {
+        memcpy(&history[32], &history[0], 16 * sizeof(uint16_t));
+        cursor = 0x1f;
+    }
+
+    history[cursor] = value;
+```
+
+This matters for symbols like `0x1a1 + 12`: it does not mean absolute `history[12]`; it means `history[marker_cursor + 12]`.
+
+When an existing history entry is replayed, the cursor is not decremented. Instead, the selected entry is moved to `history[cursor]` by shifting entries `cursor..cursor+idx-1` one slot to the right.
+
+```c
+promote_history(history, cursor, idx, value):
+    memmove(&history[cursor + 1], &history[cursor], idx * sizeof(uint16_t));
+    history[cursor] = value;
+```
 
 ### Pending Suffix States
 
@@ -705,19 +743,77 @@ pending_state = 0;
 
 For the direct literal-byte suffix state, the decoded value is emitted as one byte and the literal recent-value history is updated.
 
-### Marker Record Histories
+### Two-Byte History
 
-When the decoder emits a new explicit marker record, it also maintains a move-to-front history of marker record start offsets. This is why symbols `0x1a1` and above can reproduce a whole prior marker record without restating all bytes.
+Symbols `0x181..0x190` copy a two-byte pair from the already-produced intermediate stream and insert that pair into the two-byte history:
 
-For a copied marker record:
+```c
+distance = symbol - 0x17f;        // 0x181 => 2, 0x190 => 17
+pair = read_le16(&intermediate[len(intermediate) - distance]);
+emit low_byte(pair);
+emit high_byte(pair);
+
+insert_history(two_byte_history, word_27A76, pair);
+```
+
+Symbols `0x191..0x1a0` copy a two-byte word from the recent two-byte history and promote the selected entry within the current 16-entry window:
+
+```c
+idx = symbol - 0x191;
+slot = word_27A76 + idx;
+pair = two_byte_history[slot];
+emit low_byte(pair);
+emit high_byte(pair);
+
+promote_history(two_byte_history, word_27A76, idx, pair);
+```
+
+The copied pair is also used to update the estimated final output length. If the low byte is not `0x9e`, the estimate is incremented by two; otherwise it is incremented by one because the pair starts a marker record in the intermediate stream.
+
+### Marker Record History
+
+When the decoder emits a new explicit marker record with at least one suffix byte, it also records the offset of that marker record's control byte. It does not record the offset of the leading `0x9e`.
+
+For an explicit marker:
+
+```c
+marker_start = len(intermediate);
+emit 0x9e;
+control_offset = len(intermediate);
+emit control;
+pending_state = marker_control_class[control];
+
+if (pending_state != 0)
+    insert_history(marker_history, word_27A74, control_offset);
+```
+
+Controls with `marker_control_class[control] == 0` are not inserted into marker history.
+
+Symbols `0x1a1` and above replay one of these remembered marker records. The symbol index is relative to the marker-history cursor. Replay promotes the new copied marker's control offset within the current 16-entry history window; it does not decrement the cursor.
 
 ```c
 emit 0x9e;
-record_start = marker_history[symbol - 0x1a1];
-copy control byte from intermediate[record_start];
-copy the required one, two, or three suffix bytes according to marker_control_class[control];
+new_control_offset = len(intermediate);
+
+idx = symbol - 0x1a1;
+slot = word_27A74 + idx;
+control_offset = marker_history[slot];
+
+control = intermediate[control_offset];
+emit control;
+
+// Every remembered marker has at least one suffix byte.
+emit intermediate[control_offset + 1];
+
+if (control == 0x80) {
+    emit intermediate[control_offset + 2];
+    emit intermediate[control_offset + 3];
+} else if (control & 0x40) {
+    emit intermediate[control_offset + 2];
+}
+
 update produced_final_estimate by the marker-expanded length;
-move record_start to the front of marker_history;
+promote_history(marker_history, word_27A74, idx, new_control_offset);
 ```
 
 The marker-expanded length estimate is the same as the marker expansion pass:

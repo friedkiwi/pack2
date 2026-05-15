@@ -118,8 +118,8 @@ func TestCompressedBlockUnsupported(t *testing.T) {
 	in := []byte{'f', 'T', '1', '9', 0x01, 0x00, 0, 0, 0, 0}
 
 	_, err := NewReader(bytes.NewReader(in))
-	if !errors.Is(err, ErrUnsupportedData) {
-		t.Fatalf("err = %v, want ErrUnsupportedData", err)
+	if !errors.Is(err, ErrInvalidData) {
+		t.Fatalf("err = %v, want ErrInvalidData", err)
 	}
 }
 
