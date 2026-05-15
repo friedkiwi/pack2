@@ -9,6 +9,10 @@ original/dos/UNPACK2_unpacked.exe
 
 The original DOS executable was distributed with a Microsoft EXEPACK runtime wrapper. Reverse engineering should use `original/dos/UNPACK2_unpacked.exe`; see [EXEPACK Unpacking Notes](exepack.md) for the unpacking process and validation details.
 
+The compressed member payloads use IBM FTCOMP; see [FTCOMP Compression Notes](ftcomp.md) for the reverse-engineered decompression algorithm.
+
+The outer member/container layout is documented in [PACK2 File Format Notes](pack2_file_format.md).
+
 ## Purpose
 
 `UNPACK2` unpacks IBM PACK2/COMPRESS bundle files. The executable contains IBM copyright strings and the archive marker:
