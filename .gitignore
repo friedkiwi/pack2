@@ -1,0 +1,29 @@
+# Go build/test artifacts
+/pack2
+*.test
+*.out
+coverage.*
+
+# Local environment and editor state
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs and temporary files
+*.log
+tmp/
+temp/
+
+# IDA Pro databases and unpacked IDB contents
+*.idb
+*.i64
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.idb/
+*.i64/
