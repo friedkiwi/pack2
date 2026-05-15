@@ -77,6 +77,41 @@ func TestReadAndExtractCompressedSample(t *testing.T) {
 	}
 }
 
+func TestReadAndExtractOS2DrvSamples(t *testing.T) {
+	f, err := os.Open(filepath.Join("..", "..", "original", "examples", "os2drv.pk2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	archive, err := Read(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, name := range []string{`\os2\mdos\vsvga.sys`, `\os2\dll\VIDEOPMI.DLL`} {
+		var file File
+		found := false
+		for _, candidate := range archive.Files {
+			if candidate.Name == name {
+				file = candidate
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("file %q not found", name)
+		}
+		out, err := archive.Extract(file)
+		if err != nil {
+			t.Fatalf("extract %s: %v", name, err)
+		}
+		if int64(len(out)) != file.UnpackedSize {
+			t.Fatalf("extract %s len = %d, want %d", name, len(out), file.UnpackedSize)
+		}
+	}
+}
+
 func TestPackReadExtractRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "hello.txt")

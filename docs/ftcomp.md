@@ -446,12 +446,16 @@ marker_control_class[256] =
 ```text
 symbol_class[433] =
 0x000..0x0ff = 0
-0x100..0x180 = 1
+0x100..0x13f = 1
+0x140        = 0
+0x141..0x180 = 1
 0x181..0x1a0 = 0
 0x1a1..0x1b0 = 1
 ```
 
-This table is an easy source of a false first-frame failure. The explicit marker symbols begin at `0x100`, not `0x108`; the two-byte pair/history symbols `0x181..0x1a0` are class zero; marker-history replay symbols `0x1a1..0x1b0` are class one. A QEMU trace of DOS `UNPACK2` at the first-stage return point confirmed this table directly from runtime address `DS:0x14f2`.
+This table is an easy source of false first-frame failures. The explicit marker symbols begin at `0x100`, not `0x108`; the two-byte pair/history symbols `0x181..0x1a0` are class zero; marker-history replay symbols `0x1a1..0x1b0` are class one.
+
+There is one important `fT19` exception inside the explicit marker range: symbol `0x140` emits the literal marker escape record `9e 40`, and its class is zero. The next primary symbol must therefore be decoded with the first adaptive table, not the marker/second adaptive table. A QEMU trace of DOS `UNPACK2` on `os2drv.pk2` member `\os2\mdos\vsvga.sys` confirms this: treating `0x140` as class one makes the block-6 intermediate stream diverge at offset `0x12ca`; treating it as class zero matches the DOS-produced framed intermediate and lets the member decode.
 
 ```text
 static_model_seed_weights_le16[433] =
@@ -816,7 +820,7 @@ If segment framing is implemented but the first `segment_len` is larger than the
 
 - using the primary adaptive table for pending suffix symbols instead of the generated `0x1aa4` suffix table,
 - trying to use the generated `0x1aa4` suffix table as the model decoder or primary decoder,
-- using a shifted `symbol_class` table when scaling adaptive weights; explicit marker symbols `0x100..0x180` must be class one,
+- using a shifted `symbol_class` table when scaling adaptive weights; explicit marker symbols `0x100..0x180` are normally class one, but `0x140` is a required zero-class literal-marker escape exception,
 - skipping the tag-level static table initialization after seeing `fT19`,
 - copying the generated Huffman tables in the wrong direction because of misleading `fast_fmemcpy` argument comments,
 - diverging from the exact in-place `build_huffman_decode_tables` merge loop. In particular, a builder that repeatedly removes two queue entries and reinserts one parent is not equivalent to the DOS queue mutation order documented above,
@@ -885,7 +889,7 @@ The decoded primary symbol is interpreted by range:
 | Symbol range | Meaning |
 | --- | --- |
 | `0x000..0x0ff` | Literal byte. |
-| `0x100..0x180` | Begin an explicit marker record; emit `0x9e`, then control byte `symbol - 0x100`. |
+| `0x100..0x180` | Begin an explicit marker record; emit `0x9e`, then control byte `symbol - 0x100`. Symbol `0x140` is the `fT19` literal-marker escape and is zero-class for adaptive table selection. |
 | `0x181..0x190` | Copy a two-byte pair from the recent output window. |
 | `0x191..0x1a0` | Copy a two-byte pair from the recent two-byte history table and move it to the front. |
 | `0x1a1..` | Copy a complete previous marker record from the marker-record history and move it to the front. |

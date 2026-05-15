@@ -89,24 +89,45 @@ func NewReaderDict(r io.Reader, dict []byte) (io.ReadCloser, error) {
 
 // Decode decompresses an FTCOMP payload.
 func Decode(data []byte) ([]byte, error) {
+	return DecodeLimit(data, -1)
+}
+
+// DecodeLimit decompresses an FTCOMP payload until limit bytes have been
+// produced. A negative limit decodes the complete FTCOMP stream.
+func DecodeLimit(data []byte, limit int) ([]byte, error) {
 	if len(data) < 4 {
 		return append([]byte(nil), data...), nil
 	}
 
 	switch string(data[:4]) {
 	case tag19:
-		return decodeTagged(data[4:], Version1)
+		return decodeTagged(data[4:], Version1, limit)
 	case tag21:
-		return decodeTagged(data[4:], Version2)
+		return decodeTagged(data[4:], Version2, limit)
 	default:
 		return append([]byte(nil), data...), nil
 	}
 }
 
-func decodeTagged(data []byte, version int) ([]byte, error) {
+func decodeTagged(data []byte, version int, limit int) ([]byte, error) {
 	var out []byte
 
 	for len(data) > 0 {
+		if limit >= 0 && len(out) >= limit {
+			break
+		}
+		if len(data) >= 4 {
+			switch string(data[:4]) {
+			case tag19:
+				version = Version1
+				data = data[4:]
+				continue
+			case tag21:
+				version = Version2
+				data = data[4:]
+				continue
+			}
+		}
 		if len(data) < 2 {
 			return nil, fmt.Errorf("%w: truncated block header", ErrInvalidData)
 		}
@@ -126,6 +147,9 @@ func decodeTagged(data []byte, version int) ([]byte, error) {
 			}
 
 			out = append(out, data[:n]...)
+			if limit >= 0 && len(out) > limit {
+				return nil, fmt.Errorf("%w: output exceeds limit", ErrInvalidData)
+			}
 			data = data[n:]
 			continue
 		}
@@ -148,6 +172,9 @@ func decodeTagged(data []byte, version int) ([]byte, error) {
 			return nil, err
 		}
 		out = append(out, decoded...)
+		if limit >= 0 && len(out) > limit {
+			return nil, fmt.Errorf("%w: output exceeds limit", ErrInvalidData)
+		}
 		data = data[4+consumed:]
 		if len(data) > 0 && isPadding(data) {
 			break
@@ -604,27 +631,29 @@ func expandMarkerStream(src []byte, version int) ([]byte, error) {
 		escape = 0xff
 	}
 
-	dst := make([]byte, len(presetDictionary), len(presetDictionary)+len(src))
-	copy(dst, presetDictionary)
-	base := len(dst)
-	for i := 0; i < len(src); {
-		b := src[i]
-		i++
+	segment := make([]byte, len(markerSegmentSeed))
+	copy(segment, markerSegmentSeed)
+	dstOff := markerSegmentSeedOffset
 
+	for srcOff := 0; srcOff < len(src); {
+		b := src[srcOff]
+		srcOff++
 		if b != markerByte {
-			dst = append(dst, b)
+			segment[dstOff&0xffff] = b
+			dstOff = (dstOff + 1) & 0xffff
 			continue
 		}
 
-		if i >= len(src) {
+		if srcOff >= len(src) {
 			return nil, fmt.Errorf("%w: truncated marker record", ErrInvalidData)
 		}
 
-		code := src[i]
-		i++
+		code := src[srcOff]
+		srcOff++
 
 		if code == escape {
-			dst = append(dst, markerByte)
+			segment[dstOff&0xffff] = markerByte
+			dstOff = (dstOff + 1) & 0xffff
 			continue
 		}
 
@@ -633,39 +662,42 @@ func expandMarkerStream(src []byte, version int) ([]byte, error) {
 
 		switch {
 		case code == 0x80:
-			if len(src)-i < 3 {
+			if len(src)-srcOff < 3 {
 				return nil, fmt.Errorf("%w: truncated long marker record", ErrInvalidData)
 			}
-			length = int(src[i]) + 0x43
-			distance = int(binary.LittleEndian.Uint16(src[i+1 : i+3]))
-			i += 3
+			length = int(src[srcOff]) + 0x43
+			distance = int(binary.LittleEndian.Uint16(src[srcOff+1 : srcOff+3]))
+			srcOff += 3
 		case code&0x40 != 0:
-			if len(src)-i < 2 {
+			if len(src)-srcOff < 2 {
 				return nil, fmt.Errorf("%w: truncated medium marker record", ErrInvalidData)
 			}
 			length = int(code&0x3f) + 3
-			distance = int(binary.LittleEndian.Uint16(src[i : i+2]))
-			i += 2
+			distance = int(binary.LittleEndian.Uint16(src[srcOff : srcOff+2]))
+			srcOff += 2
 		default:
-			if len(src)-i < 1 {
+			if srcOff >= len(src) {
 				return nil, fmt.Errorf("%w: truncated short marker record", ErrInvalidData)
 			}
 			length = int(code) + 3
-			distance = int(src[i])
-			i++
+			distance = int(src[srcOff])
+			srcOff++
 		}
 
-		copyFrom := len(dst) - distance - 1
-		if copyFrom < 0 {
-			return nil, fmt.Errorf("%w: invalid marker distance at marker offset %d length %d distance %d output %d", ErrInvalidData, i, length, distance, len(dst))
-		}
+		copyFrom := (dstOff - distance - 1) & 0xffff
 		for range length {
-			dst = append(dst, dst[copyFrom])
-			copyFrom++
+			segment[dstOff&0xffff] = segment[copyFrom&0xffff]
+			dstOff = (dstOff + 1) & 0xffff
+			copyFrom = (copyFrom + 1) & 0xffff
 		}
 	}
 
-	return dst[base:], nil
+	n := (dstOff - markerSegmentSeedOffset) & 0xffff
+	out := make([]byte, n)
+	for i := range out {
+		out[i] = segment[(markerSegmentSeedOffset+i)&0xffff]
+	}
+	return out, nil
 }
 
 func expandRLE(src []byte) ([]byte, error) {

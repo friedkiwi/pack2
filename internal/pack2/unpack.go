@@ -155,13 +155,7 @@ func (a *Archive) Extract(file File) ([]byte, error) {
 		if len(payload) < 4 {
 			return nil, fmt.Errorf("%w: truncated FTCOMP payload prefix", ErrInvalidArchive)
 		}
-		r, err := ftcomp.NewReader(bytes.NewReader(payload[4:]))
-		if err != nil {
-			return nil, err
-		}
-		defer r.Close()
-
-		out, err := io.ReadAll(r)
+		out, err := ftcomp.DecodeLimit(payload[4:], int(file.UnpackedSize))
 		if err != nil {
 			return nil, err
 		}

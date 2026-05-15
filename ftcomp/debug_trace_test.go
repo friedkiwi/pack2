@@ -74,6 +74,216 @@ func TestDebugEvaluateIntermediate(t *testing.T) {
 	}
 }
 
+func TestDebugOS2DrvBlocks(t *testing.T) {
+	if os.Getenv("FTCOMP_DEBUG_OS2DRV") == "" {
+		t.Skip("debug only")
+	}
+	data, err := os.ReadFile("../original/examples/os2drv.pk2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloadOff := 0x3e + 4
+	if os.Getenv("FTCOMP_DEBUG_OS2DRV_SECOND") != "" {
+		payloadOff = 0x4840 + 4
+	}
+	if s := os.Getenv("FTCOMP_DEBUG_OS2DRV_PAYLOAD_OFF"); s != "" {
+		var off int64
+		if _, err := fmt.Sscanf(s, "%x", &off); err != nil {
+			t.Fatal(err)
+		}
+		payloadOff = int(off) + 4
+	}
+	payload := data[payloadOff:]
+	stream := payload
+	version := Version1
+	if string(stream[:4]) == tag19 {
+		stream = stream[4:]
+	} else if string(stream[:4]) == tag21 {
+		version = Version2
+		stream = stream[4:]
+	}
+	outLen := 0
+	for blockNo := 0; len(stream) > 0 && blockNo < 20; blockNo++ {
+		if len(stream) >= 4 && (string(stream[:4]) == tag19 || string(stream[:4]) == tag21) {
+			t.Logf("block %d streamOff=%#x tag=%q", blockNo, len(payload)-len(stream), stream[:4])
+			if string(stream[:4]) == tag19 {
+				version = Version1
+			} else {
+				version = Version2
+			}
+			stream = stream[4:]
+			continue
+		}
+		target := binary.LittleEndian.Uint16(stream[:2])
+		t.Logf("block %d streamOff=%#x target=%#x out=%d prefix=% x", blockNo, len(payload)-4-len(stream), target, outLen, stream[:min(len(stream), 16)])
+		if target == 0xffff {
+			n := int(binary.LittleEndian.Uint16(stream[2:4]))
+			outLen += n
+			stream = stream[4+n:]
+			continue
+		}
+		block := compressedBlock{
+			intermediateTarget: int(target),
+			literalWeightA:     stream[2],
+			markerWeightA:      stream[3],
+			markerWeightB:      stream[4],
+			literalWeightB:     stream[5],
+			bitstream:          stream[6:],
+			version:            version,
+			bytesProduced:      outLen,
+		}
+		decoded, consumed, err := decodeCompressedBlock(block)
+		t.Logf("block %d decoded=%d consumed=%d err=%v", blockNo, len(decoded), consumed, err)
+		if err != nil {
+			if os.Getenv("FTCOMP_DEBUG_WRITE_INTERMEDIATE") != "" {
+				br := newBitReader(block.bitstream)
+				staticTable, err := buildHuffTable(staticWeights)
+				if err != nil {
+					t.Fatal(err)
+				}
+				model := make([]uint16, modelSymbolCount)
+				for i := 0; i < modelSymbolCount; {
+					sym, err := staticTable.decode(br)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if sym == 0x100 {
+						i += min(16, modelSymbolCount-i)
+						continue
+					}
+					model[i] = uint16(byte(sym))
+					i++
+				}
+				tableA, err := buildAdaptiveTable(model, block.literalWeightA, block.markerWeightA)
+				if err != nil {
+					t.Fatal(err)
+				}
+				tableB := tableA
+				if (block.literalWeightB != block.literalWeightA || block.markerWeightB != block.markerWeightA) &&
+					(block.literalWeightB != 0 || block.markerWeightB != 0) {
+					tableB, err = buildAdaptiveTable(model, block.literalWeightB, block.markerWeightB)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				suffixTable, err := buildHuffTable(taggedWeights)
+				if err != nil {
+					t.Fatal(err)
+				}
+				intermediate, err := decodeIntermediate(br, tableA, tableB, suffixTable, block)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile("/private/tmp/go-block-intermediate.bin", intermediate, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			break
+		}
+		outLen += len(decoded)
+		stream = stream[6+consumed:]
+	}
+}
+
+func TestDebugOS2DrvBlock6HuffVariants(t *testing.T) {
+	if os.Getenv("FTCOMP_DEBUG_OS2DRV_VARIANTS") == "" {
+		t.Skip("debug only")
+	}
+	data, err := os.ReadFile("../original/examples/os2drv.pk2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadFile("../dos-block6-intermediate.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := data[0x4840+4:]
+	stream := payload[4:]
+	for i := 0; i < 3; i++ {
+		target := int(binary.LittleEndian.Uint16(stream[:2]))
+		block := compressedBlock{
+			intermediateTarget: target,
+			literalWeightA:     stream[2],
+			markerWeightA:      stream[3],
+			markerWeightB:      stream[4],
+			literalWeightB:     stream[5],
+			bitstream:          stream[6:],
+			version:            Version1,
+		}
+		_, consumed, err := decodeCompressedBlock(block)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stream = stream[6+consumed:]
+		if len(stream) >= 4 && string(stream[:4]) == tag19 {
+			stream = stream[4:]
+		}
+	}
+	block := compressedBlock{
+		intermediateTarget: int(binary.LittleEndian.Uint16(stream[:2])),
+		literalWeightA:     stream[2],
+		markerWeightA:      stream[3],
+		markerWeightB:      stream[4],
+		literalWeightB:     stream[5],
+		bitstream:          stream[6:],
+		version:            Version1,
+		bytesProduced:      73728,
+	}
+	staticTable, err := buildHuffTable(staticWeights)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for sortMode := 0; sortMode < 4; sortMode++ {
+		for insertAfterEqual := 0; insertAfterEqual < 2; insertAfterEqual++ {
+			for childSwap := 0; childSwap < 2; childSwap++ {
+				br := newBitReader(block.bitstream)
+				model := make([]uint16, modelSymbolCount)
+				for i := 0; i < modelSymbolCount; {
+					sym, err := staticTable.decode(br)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if sym == 0x100 {
+						i += min(16, modelSymbolCount-i)
+						continue
+					}
+					model[i] = uint16(byte(sym))
+					i++
+				}
+				tableA, err := buildAdaptiveTable(model, block.literalWeightA, block.markerWeightA)
+				if err != nil {
+					t.Fatal(err)
+				}
+				tableB, err := buildAdaptiveTableVariant(model, block.literalWeightB, block.markerWeightB, sortMode, insertAfterEqual != 0, childSwap != 0)
+				if err != nil {
+					t.Logf("variant sort=%d after=%d child=%d err=%v", sortMode, insertAfterEqual, childSwap, err)
+					continue
+				}
+				suffixTable, err := buildHuffTable(taggedWeights)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := decodeIntermediate(br, tableA, tableB, suffixTable, block)
+				if err != nil {
+					t.Logf("variant sort=%d after=%d child=%d decode err=%v", sortMode, insertAfterEqual, childSwap, err)
+					continue
+				}
+				diff := -1
+				for i := 0; i < min(len(got), len(want)); i++ {
+					if got[i] != want[i] {
+						diff = i
+						break
+					}
+				}
+				if diff < 0 && len(got) != len(want) {
+					diff = min(len(got), len(want))
+				}
+				t.Logf("variant sort=%d after=%d child=%d diff=%#x prefix=% x", sortMode, insertAfterEqual, childSwap, diff, got[:min(len(got), 16)])
+			}
+		}
+	}
+}
+
 func writeDebugU16s(t *testing.T, path string, values []uint16) {
 	t.Helper()
 	buf := make([]byte, len(values)*2)

@@ -170,14 +170,17 @@ See [FTCOMP Compression Notes](ftcomp.md) for the payload decompression algorith
 
 ## Primary and Auxiliary Payloads
 
-Each member has a primary FTCOMP payload that decompresses to the file bytes named by the member header. Some archive members also carry an auxiliary FTCOMP payload after the primary one. The new `.pk2` bundle samples show this pattern in OS/2 driver archives.
+Each member has a primary FTCOMP payload that decompresses to the file bytes named by the member header. Some archive members also carry auxiliary FTCOMP data after the primary file data. The `.pk2` bundle samples show this pattern in OS/2 driver archives.
 
-When `data_end_offset == 0`, the primary payload runs to:
+The container header bounds the member payload:
 
 - `next_member_offset`, for non-final members.
 - `file_size - 4`, for final members.
+- `data_end_offset`, when that field is non-zero.
 
-When `data_end_offset != 0`, the primary payload runs only to `data_end_offset`. If there are bytes after that before the next member or final trailer, those bytes form an auxiliary FTCOMP stream. The auxiliary stream has the same 4-byte `80 60 00 00` prefix and then usually begins with `fT19`.
+That bound is not always the same as "bytes needed to extract the named file". For FTCOMP method type `1`, `UNPACK2` stops the primary extraction once the decoded output reaches the member header's `unpacked_size`. Bytes that remain inside the member payload after that point are auxiliary data and must not be decoded as more primary blocks or appended to the extracted file.
+
+Auxiliary data may be a separate FTCOMP stream with the same 4-byte `80 60 00 00` prefix and then usually `fT19`, or it may begin immediately after the last primary block in the same bounded member payload. A reader that decodes until the physical payload end can fail after successfully producing the primary file, for example by treating auxiliary bytes as a bogus compressed block.
 
 Observed auxiliary streams contain OS/2 metadata-like records such as `.TYPE`, `.APP`, `.ICON`, and `CHECKSUM`. These are not part of the primary file content and should not be appended to the extracted file bytes.
 
