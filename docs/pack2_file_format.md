@@ -12,6 +12,7 @@ These notes are based on:
 - The sample files:
   - `original/examples/DUMMY.TX_`
   - `original/examples/USING.IN_`
+  - `original/examples/EVALUATE.LI_`
 - `file(1)`/libmagic recognition of FTCOMP files.
 - Public usage-level PACK2/UNPACK2 documentation and examples.
 
@@ -186,6 +187,7 @@ This formula matches the current single-member samples:
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `DUMMY.TX_` | 62 | 10 | 51 | 58 | 7 |
 | `USING.IN_` | 1739 | 10 | 51 | 1735 | 1684 |
+| `EVALUATE.LI_` | 487 | 13 | 54 | 483 | 429 |
 
 The four physical bytes after `payload_end` are currently not fully identified. In the samples they are present after the effective FTCOMP data region. Treat them as a final-member trailer until more multi-member samples are available.
 
@@ -284,6 +286,51 @@ Payload starts with:
 ```
 
 The FTCOMP stream after the 4-byte prefix starts with `fT19`.
+
+### `original/examples/EVALUATE.LI_`
+
+`EVALUATE.LI_` validates the same container layout, but unlike the earlier samples, its FTCOMP stream uses a compressed block.
+
+Hex header and stream start:
+
+```text
+00000000: a5 96 fd ff 78 24 40 19 20 00 00 00 00 00 00 00
+00000010: ab 02 00 00 00 00 00 00 46 54 43 4f 4d 50 00 00
+00000020: 00 01 00 04 00 00 00 0d 00 45 56 41 4c 55 41 54
+00000030: 45 2e 4c 49 43 00 80 60 00 00 66 54 31 39 e3 01
+00000040: e0 9d 61 1e ...
+```
+
+Parsed:
+
+```text
+magic0            0x96a5
+magic1            0xfffd
+dos_date          0x2478 -> 1998-03-24
+dos_time          0x1940 -> 03:10:00
+file_attrs        0x0020
+unpacked_size     683
+next_member       0
+method            FTCOMP
+method_arg0       0x0000
+method_type       1
+method_arg1       4
+filename_len      13
+filename          EVALUATE.LIC
+payload_offset    54
+effective payload 429 bytes
+```
+
+Payload interpretation:
+
+```text
+80 60 00 00    member-level FTCOMP prefix
+66 54 31 39    FTCOMP stream tag, "fT19"
+e3 01          first block compressed intermediate target, 0x01e3 bytes
+e0 9d 61 1e    compressed-block weight bytes
+```
+
+This sample proves that listing a member and extracting stored/raw FTCOMP blocks is not sufficient for general PACK2 extraction. A complete reader must implement the FTCOMP compressed-block path described in [FTCOMP Compression Notes](ftcomp.md).
 
 ## Minimal Parser Pseudocode
 

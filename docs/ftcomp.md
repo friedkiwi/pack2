@@ -139,6 +139,26 @@ Observed field usage:
 - The bitstream starts at block offset `6`.
 - `compressed_bytes_consumed` is computed from the internal input cursor after decoding, plus the 4-byte stream tag at the top level.
 
+`original/examples/EVALUATE.LI_` exercises this path. After the PACK2 member prefix, its FTCOMP stream begins:
+
+```text
+66 54 31 39 e3 01 e0 9d 61 1e ...
+```
+
+Parsed as:
+
+```text
+tag                   fT19
+intermediate_target   0x01e3 / 483 bytes
+literal_weight_a      0xe0
+marker_weight_a       0x9d
+literal_weight_b      0x61
+marker_weight_b       0x1e
+final output size     683 bytes, from the PACK2 member header
+```
+
+This is the first required negative test for incomplete readers: if a decoder accepts only raw blocks (`ff ff`) and rejects this sample with an error such as "compressed FTCOMP blocks are not implemented", the missing part is not the PACK2 container parser. The missing part is the compressed-block pipeline: model Huffman decode, adaptive table rebuild, main intermediate stream decode, and marker expansion.
+
 IDA function:
 
 ```text
@@ -166,7 +186,7 @@ bitbuf <<= n;
 bits_available -= n;
 ```
 
-The Huffman fast path indexes tables with the top 9 bits or top 7 bits depending on the table being used.
+The Huffman fast path indexes tables with the top 9 bits of the 16-bit bit buffer.
 
 ## Huffman Tables
 
@@ -216,6 +236,245 @@ build_huffman_decode_tables
 rebuild_adaptive_huffman_tables
 ```
 
+### Table Work Areas
+
+The DOS implementation stores FTCOMP state in global data. The names below are descriptive; the addresses are the IDA offsets from `UNPACK2_unpacked.exe`.
+
+| Address | Size | Meaning |
+| --- | ---: | --- |
+| `0x528e` | `0x1b30` | Huffman node work area, 870 records of 8 bytes. |
+| `0x6dbe` | `0x0400` | Generated fast symbol table, 512 `uint16` entries indexed by the top 9 bits. |
+| `0x71be` | `0x0200` | Generated fast bit-length table, 512 `uint8` entries. |
+| `0x73be` | `0x0400` | Snapshot of the first adaptive fast symbol table. |
+| `0x77be` | `0x0200` | Snapshot of the first adaptive fast length table. |
+| `0x79be` | `0x0362` | Per-block model weights, 433 `uint16` entries. |
+| `0x82aa` | `0x0060` | Recent marker-record offset history, 48 `uint16` slots. |
+| `0x870e` | `0x0060` | Recent two-byte literal/history table, 48 `uint16` slots. |
+| `0x13f2` | `0x0100` | Marker-control class table indexed by marker control byte. |
+| `0x14f2` | `0x01b1` | Symbol class table; non-zero symbols use the second adaptive table. |
+| `0x16a4` | `0x0400` | Static/model fast symbol table snapshot. |
+| `0x1aa4` | `0x0400` | Active adaptive fast symbol table snapshot used by suffix decodes. |
+| `0x2574` | `0x1588` | Static/model Huffman node snapshot. |
+| `0x3afc` | `0x1588` | Active adaptive Huffman node snapshot. |
+| `0x830e` | `0x0200` | Static/model fast bit-length table snapshot. |
+| `0x850e` | `0x0200` | Active adaptive fast bit-length table snapshot used by suffix decodes. |
+
+The 8-byte node records at `0x528e` and in the snapshots are:
+
+```c
+struct huff_node {
+    uint16_t weight;       // scaled frequency/weight
+    uint16_t parent;       // parent node id, or 0 while unlinked
+    uint16_t child0;       // left/zero child for internal nodes
+    uint16_t child1;       // right/one child for internal nodes
+};
+```
+
+Node ids are stored as byte offsets into the node table, not as dense indexes. Leaf symbol `n` has node id `n * 4`. Internal node ids start at `0x06c4`, which is `433 * 4`.
+
+### Static Huffman Initialization
+
+`ftcomp_init_decompressor(mode, use_static_tables)` records:
+
+```text
+byte_29BB2 = mode
+byte_2C8CC = use_static_tables
+word_27A4C:len = far pointer to an alternate adaptive node snapshot area
+```
+
+When `mode` requires generated static tables, it:
+
+1. Clears `huff_node[870]` at `0x528e`.
+2. Copies 433 initial static weights from `0x16a4` into `node[i].weight`.
+3. Calls `build_huffman_decode_tables`.
+4. Copies the resulting node table and fast tables into the static/model snapshots:
+
+```text
+0x528e -> 0x2574, length 0x1588
+0x6dbe -> 0x16a4, length 0x0400
+0x71be -> 0x830e, length 0x0200
+```
+
+`ftcomp_init_static_tables` then resets the decompression byte counter and initializes fixed lookup tables:
+
+- `word_2F8E0 = 0`.
+- If `use_static_tables != 0 && mode == 1`, it selects static table block `0xc022`.
+- Otherwise it selects static table block `0xbc62`, resets the output byte counter to `0x0000137a`, and fills three fixed arrays:
+  - `0xbc64`, 0x140 bytes, value `0x20`.
+  - `0xbda4`, 0x140 bytes, value `0xff`.
+  - `0xbee4`, 0x140 bytes, value `0x00`.
+- It copies 0x0fba bytes from `0x0438` to `0xc024`.
+- It stores the selected static table pointer in `word_27A6E`.
+- It records the initialized mode in `byte_2F8DA`.
+
+For a clean implementation, these fixed arrays are constants from `UNPACK2`. They are not derived from the compressed input. The generated static/model Huffman tables can be reproduced from the 433 static weights and the table-builder below.
+
+In the unpacked DOS executable, the initialized DGROUP data used by these offsets is present in `original/dos/UNPACK2_unpacked.exe` at:
+
+```text
+file_offset = dgroup_offset + 0x17840
+```
+
+Constants needed for the `fT19` compressed path can therefore be extracted from:
+
+| Runtime offset | File offset | Size | Contents |
+| --- | ---: | ---: | --- |
+| `0x13f2` | `0x18c32` | `0x0100` | Marker-control class table. |
+| `0x14f2` | `0x18d32` | `0x01b1` | Symbol class table. |
+| `0x16a4` | `0x18ee4` | `0x0362` | Initial static/model Huffman weights, 433 `uint16` values. |
+| `0x0438` | `0x17c78` | `0x0fba` | Fixed static table block copied to `0xc024` by `ftcomp_init_static_tables`. |
+
+The `fT19` sample `EVALUATE.LI_` needs the first three rows. The `0x0438` block is part of the original runtime state setup; keep it when cloning the DOS implementation's table layout exactly.
+
+### Generic Huffman Table Builder
+
+`build_huffman_decode_tables` consumes `node[0..432].weight` and rebuilds:
+
+- Parent/child links in the node table.
+- A 512-entry fast symbol table.
+- A 512-entry fast bit-length table.
+
+The builder treats zero weights as absent symbols. Non-zero leaves are inserted into a sorted queue keyed by `weight`; ties preserve the existing order in the queue.
+
+Special case: if there is only one non-zero symbol, the builder adds the last zero-weight symbol as a synthetic second leaf with weight `1`.
+
+Implementation-level outline:
+
+```c
+// Gather leaves.
+queue = []
+last_zero_node = 0
+for symbol = 0; symbol < 0x1b1; symbol++ {
+    node_id = symbol * 4
+    node[symbol].parent = 0
+
+    if node[symbol].weight == 0 {
+        last_zero_node = node_id
+        continue
+    }
+
+    queue.push(node_id)
+}
+
+if len(queue) == 1 {
+    node[last_zero_node / 4].weight = 1
+    queue.push(last_zero_node)
+}
+
+stable_sort_by_weight(queue)
+
+next_internal = 0x06c4
+while len(queue) > 1 {
+    left = queue.pop_front()
+    right = queue.pop_front()
+
+    parent = next_internal
+    next_internal += 4
+
+    node[parent / 4].weight = node[left / 4].weight + node[right / 4].weight
+    node[parent / 4].parent = 0
+    node[parent / 4].child0 = left
+    node[parent / 4].child1 = right
+    node[left / 4].parent = parent
+    node[right / 4].parent = parent
+
+    insert parent back into queue before the first entry whose weight is
+    greater than or equal to node[parent].weight
+}
+
+root = queue[0]
+word_2F8D6 = root
+word_2F8D8 = 0
+```
+
+After the tree is built, the DOS implementation fills the 9-bit fast tables when the active global table mode requests generated fast tables. Otherwise the same table shape is supplied from the prebuilt static snapshots.
+
+```c
+for prefix = 0; prefix < 512; prefix++ {
+    bits = prefix << 7;       // top 9 bits in a 16-bit bit buffer
+    nbits = 0;
+    node_id = root;
+
+    while node_id >= 0x06c4 && nbits < 9 {
+        if (bits & 0x8000)
+            node_id = node[node_id / 4].child1;
+        else
+            node_id = node[node_id / 4].child0;
+        bits <<= 1;
+        nbits++;
+    }
+
+    fast_symbol[prefix] = node_id;
+    fast_nbits[prefix] = nbits;
+}
+```
+
+If `fast_symbol[prefix]` is still an internal node, the decoder consumes the fast bits and continues walking the tree one bit at a time.
+
+### Adaptive Table Rebuild
+
+Compressed blocks begin by decoding 433 model weights into `model[0x1b1]` at `0x79be`. `rebuild_adaptive_huffman_tables` then builds one or two adaptive tables from that model.
+
+The first adaptive table uses the first two block weight bytes:
+
+```c
+for symbol = 0; symbol < 0x1b1; symbol++ {
+    m = model[symbol];
+    if (m == 0) {
+        node[symbol].weight = 0;
+        continue;
+    }
+
+    if (symbol_class[symbol] != 0)
+        w = m * marker_weight_a;       // byte at block offset +3
+    else
+        w = m * literal_weight_a;      // byte at block offset +2
+
+    node[symbol].weight = w;
+    max_weight = max(max_weight, w);
+}
+
+scale_weights_to_byte_range(node, max_weight);
+build_huffman_decode_tables();
+```
+
+Scaling is exact:
+
+```c
+if (max_weight > 0xff) {
+    scale = 0xffff / max_weight;
+    for each node weight {
+        old = weight;
+        weight = (weight * scale) >> 8;
+        if (old != 0 && weight == 0)
+            weight = 1;
+    }
+}
+```
+
+The generated first table is saved:
+
+```text
+0x528e -> adaptive_node_snapshot_0, length 0x1b30
+0x6dbe -> 0x73be, length 0x0400
+0x71be -> 0x77be, length 0x0200
+```
+
+If the second pair of block weight bytes is identical to the first pair, or if both second-pair bytes are zero, the first table is reused. Otherwise the second adaptive table is built the same way using:
+
+```text
+literal_weight_b = block byte +4
+marker_weight_b  = block byte +5
+```
+
+The second generated table remains in the active work areas:
+
+```text
+0x528e, 0x6dbe, 0x71be
+```
+
+The main symbol decoder chooses between the first and second adaptive tables using `symbol_class[symbol]`.
+
 ## Per-Block Model Decode
 
 Compressed blocks begin by decoding `0x1b1` model entries into a frequency/model table.
@@ -224,7 +483,11 @@ Pseudocode:
 
 ```c
 for (i = 0; i < 0x1b1; ) {
-    sym = decode_symbol_with_static_model();
+    sym = decode_symbol(
+        static_fast_symbol,       // 0x16a4
+        static_fast_nbits,        // 0x830e
+        static_nodes              // 0x2574
+    );
 
     if (sym == 0x100) {
         // Zero run. Up to 16 zero entries are emitted, bounded by 0x1b1.
@@ -239,6 +502,8 @@ for (i = 0; i < 0x1b1; ) {
 rebuild_adaptive_huffman_tables(model, block_weight_fields);
 ```
 
+The zero-run symbol always emits exactly 16 zero model entries unless fewer than 16 entries remain in the 433-entry model.
+
 The adaptive table rebuild multiplies non-zero model entries by one of two weight bytes. Which weight byte is used depends on an auxiliary symbol-class table. `fT21` has two sets of weight bytes; if both sets are equal or the second set is zero, it reuses the first generated table.
 
 Implementation guidance:
@@ -251,14 +516,9 @@ Implementation guidance:
 
 After the model has been decoded and adaptive tables rebuilt, the block bitstream produces an intermediate stream. The loop runs until `intermediate_target` bytes have been written.
 
-The intermediate stream contains:
+The intermediate stream contains literal bytes and `0x9e` marker records. It is not the final output. It is later passed to marker expansion.
 
-- Literal bytes.
-- `0x9e` marker records.
-- Two-byte records used later by marker expansion.
-- State-dependent references to recent values.
-
-Important marker:
+Important marker byte:
 
 ```text
 0x9e
@@ -272,21 +532,206 @@ if literal == 0x9e and version == fT21:
     emit 0xff;   // escape literal marker for later marker-expansion stage
 ```
 
-For encoded references, the decoder emits `0x9e` followed by control bytes. These are expanded in the marker stage described below.
+For encoded references, the decoder emits `0x9e` followed by one to four control bytes. These are expanded in the marker stage described below.
 
-The main decoder keeps recent-value state for several classes. Encoded symbols `0x100` and, in `fT21`, `0x101`, refer to recent values instead of directly carrying a new value. This is similar to move-to-front coding:
+### Primary Symbol Decode
 
-- `0x100` means repeat the most recent value for that class.
-- `0x101` means use the second-most-recent value for that class.
-- Other values are adjusted around the recent values so the code space does not waste symbols on the two recency aliases.
+The primary symbol decoder uses a 9-bit fast lookup followed by bit-by-bit tree walking:
 
-The exact classes are selected by short prefix codes from the bitstream. In implementation terms, the decoder has separate recent-value slots for:
+```c
+symbol_node = fast_symbol[bitbuf >> 7];
+nbits = fast_nbits[bitbuf >> 7];
+consume(nbits);
 
-- Single-byte literal class.
-- Several short-distance/length classes.
-- A six-symbol rolling class used by the version-2 path.
+while (symbol_node >= 0x06c4) {
+    bit = read_bit();
+    if (bit)
+        symbol_node = node[symbol_node / 4].child1;
+    else
+        symbol_node = node[symbol_node / 4].child0;
+}
 
-The IDA names for these local slots are still synthetic, so a clean implementation should validate this part against known compressed samples.
+symbol = symbol_node >> 2;
+```
+
+At the start of a primary decode, `UNPACK2` chooses the first or second adaptive table:
+
+- If the current sub-state flag is zero, it decodes through the first adaptive snapshot (`0x73be`, `0x77be`, and `adaptive_node_snapshot_0`).
+- If the sub-state flag is non-zero, it decodes through the active second table (`0x6dbe`, `0x71be`, and `0x528e`).
+
+After a symbol is decoded, `symbol_class[symbol]` from `0x14f2` becomes the next sub-state flag.
+
+### Primary Symbol Ranges
+
+The decoded primary symbol is interpreted by range:
+
+| Symbol range | Meaning |
+| --- | --- |
+| `0x000..0x0ff` | Literal byte. |
+| `0x100..0x180` | Begin an explicit marker record; emit `0x9e`, then control byte `symbol - 0x100`. |
+| `0x181..0x190` | Copy a two-byte pair from the recent output window. |
+| `0x191..0x1a0` | Copy a two-byte pair from the recent two-byte history table and move it to the front. |
+| `0x1a1..` | Copy a complete previous marker record from the marker-record history and move it to the front. |
+
+Literal handling:
+
+```c
+emit byte(symbol);
+produced_final_estimate += 1;
+
+if (symbol == 0x9e && version == fT21)
+    emit 0xff;          // escape literal marker for marker expansion
+```
+
+Explicit marker handling:
+
+```c
+control = symbol - 0x100;
+emit 0x9e;
+emit control;
+pending_state = marker_control_class[control];   // table at 0x13f2
+```
+
+If `pending_state` is zero, the marker record is complete. If it is non-zero, later suffix decodes append the remaining marker bytes.
+
+The decoder keeps two move-to-front histories:
+
+- A 48-entry two-byte history at `0x870e`.
+- A 48-entry marker-record offset history at `0x82aa`.
+
+When a history symbol is used, the selected record is emitted and moved to the front by shifting the older entries right with `memmove`.
+
+### Pending Suffix States
+
+Some explicit marker controls need extra bytes after the control byte. `UNPACK2` stores this in the high byte of a local state word. The suffix decoder runs before returning to normal primary-symbol mode.
+
+The suffix decoder first reads a small raw prefix from the bitstream. It returns:
+
+```text
+suffix_low_bits  // called var_C in IDA
+suffix_class     // called var_14 in IDA; values 0, 1, or 2
+```
+
+For the normal `fT19` path:
+
+```c
+if ((bitbuf & 0x8000) == 0) {
+    suffix_class = 0;
+    suffix_low_bits = (bitbuf >> 11) & 0x0f;
+    consume(5);
+} else if ((bitbuf & 0x4000) == 0) {
+    suffix_class = 1;
+    if (bytes_produced_so_far < 0x5100) {
+        suffix_low_bits = (bitbuf >> 9) & 0x3f;
+        consume(7);
+    } else {
+        suffix_low_bits = (bitbuf >> 8) & 0x3f;
+        consume(8);
+    }
+} else {
+    suffix_class = 2;
+    if (bytes_produced_so_far < 0x9100) {
+        suffix_low_bits = (bitbuf >> 8) & 0x3f;
+        consume(8);
+    } else {
+        suffix_low_bits = (bitbuf >> 7) & 0x7f;
+        consume(9);
+    }
+}
+```
+
+There is a version-2 special case after control byte `0x40`: it sets a flag and uses a 2-bit prefix instead of the normal prefix tree.
+
+After the raw prefix, the decoder reads one adaptive Huffman symbol and applies a small move-to-front transform. Symbols `0x100` and, for `fT21`, `0x101`, mean "reuse the most recent" and "reuse the second-most-recent" value for the current suffix class. Other values are adjusted upward so the aliases do not consume code space:
+
+```c
+decode_mtf(value, recent0, recent1):
+    if value == 0x100:
+        value = recent0;
+    else if version == fT21 && value == 0x101:
+        value = recent1;
+    else {
+        if (recent1 < recent0) {
+            if (recent1 <= value) value++;
+            if (recent0 <= value) value++;
+        } else {
+            if (recent0 <= value) value++;
+            if (recent1 <= value) value++;
+        }
+        recent1 = recent0;
+        recent0 = value;
+    }
+    return value;
+```
+
+The DOS code has separate `recent0/recent1` pairs for:
+
+- Literal suffix bytes.
+- Suffix class 0.
+- Suffix class 1.
+- Suffix class 2.
+- The version-2 special six-symbol rolling state.
+
+### Suffix Word Encoding
+
+For marker suffix states other than the direct literal-byte state, the decoder appends a little-endian 16-bit word to the intermediate stream. The word is built from the decoded MTF value and the raw prefix:
+
+```c
+switch suffix_class {
+case 0:
+    word = ((value + 0x10) << 4) | suffix_low_bits;
+case 1:
+    word = ((value + 0x44) << 6) | suffix_low_bits;
+case 2:
+    if (bytes_produced_so_far < 0x9100)
+        word = ((value + 0x144) << 6) | suffix_low_bits;
+    else
+        word = ((value + 0x0a2) << 7) | suffix_low_bits;
+}
+
+emit low_byte(word);
+emit high_byte(word);
+pending_state = 0;
+```
+
+For the version-2 special control-`0x40` state:
+
+```c
+word = ((value + 0x40) << 2) | suffix_low_bits;
+emit low_byte(word);
+emit high_byte(word);
+pending_state = 0;
+```
+
+For the direct literal-byte suffix state, the decoded value is emitted as one byte and the literal recent-value history is updated.
+
+### Marker Record Histories
+
+When the decoder emits a new explicit marker record, it also maintains a move-to-front history of marker record start offsets. This is why symbols `0x1a1` and above can reproduce a whole prior marker record without restating all bytes.
+
+For a copied marker record:
+
+```c
+emit 0x9e;
+record_start = marker_history[symbol - 0x1a1];
+copy control byte from intermediate[record_start];
+copy the required one, two, or three suffix bytes according to marker_control_class[control];
+update produced_final_estimate by the marker-expanded length;
+move record_start to the front of marker_history;
+```
+
+The marker-expanded length estimate is the same as the marker expansion pass:
+
+```c
+if control == 0x80:
+    length = suffix_byte0 + 0x43;
+else if control & 0x40:
+    length = (control & 0x3f) + 3;
+else:
+    length = control + 3;
+```
+
+The estimate is used only to adjust distance-code thresholds while decoding the current block.
 
 ## Marker Expansion
 
@@ -467,8 +912,9 @@ Validation strategy:
 1. Add tests for marker expansion independently.
 2. Add tests for raw FTCOMP blocks.
 3. Add tests for `fT19` and `fT21` tag detection.
-4. Compare full decompression output against IBM `UNPACK2` for known PACK2/FTCOMP samples.
-5. Add trace logging for:
+4. Add `original/examples/EVALUATE.LI_` as a compressed `fT19` fixture. The first block has intermediate target `0x01e3` and must expand to the member header's 683-byte final output.
+5. Compare full decompression output against IBM `UNPACK2` for known PACK2/FTCOMP samples.
+6. Add trace logging for:
    - block start offset
    - block type
    - compressed bytes consumed
@@ -482,7 +928,7 @@ These items are not yet fully confirmed:
 
 - The semantic names of the four compressed-block weight bytes.
 - The exact field name for `intermediate_target`; behavior says it bounds the first-stage intermediate output.
-- The exact main-stream recent-value classes. The behavior is visible in IDA, but the cleanest written spec needs sample-driven confirmation.
+- The fixed static tables should be transcribed into source form before implementing a standalone decoder. The docs identify their IDA locations and usage, but do not inline the full constant byte arrays.
 - The exact version-2 RLE side-stream split field name and all edge cases.
 
-The `0x9e` marker expansion format is the most certain part of the algorithm and should be implemented first.
+The `EVALUATE.LI_` test case is `fT19`, so it does not require the version-2 RLE pass.
