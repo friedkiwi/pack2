@@ -146,3 +146,18 @@ func TestExpandMarkerStreamEscape(t *testing.T) {
 		t.Fatalf("out = %x, want %x", out, want)
 	}
 }
+
+func TestExpandFramedIntermediate(t *testing.T) {
+	in := []byte{
+		0x04, 0x00, 0x00, 'a', 'b', 'c',
+		0x07, 0x00, 0x01, 'a', 'b', 'c', markerByte, 0x00, 0x02,
+	}
+
+	out, err := expandFramedIntermediate(in, Version1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(out), "abcabcabc"; got != want {
+		t.Fatalf("out = %q, want %q", got, want)
+	}
+}

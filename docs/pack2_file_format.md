@@ -9,10 +9,14 @@ It covers the archive/member container. The compressed payload format is documen
 These notes are based on:
 
 - IDA Pro analysis of `original/dos/UNPACK2_unpacked.exe`.
+- IDA Pro analysis of the OS/2 NE `original/os2/UNPACK2.EXE`, which confirms the same member scanner, header reader, payload-bound calculation, and FTCOMP extraction path with different implementation addresses.
 - The sample files:
   - `original/examples/DUMMY.TX_`
   - `original/examples/USING.IN_`
   - `original/examples/EVALUATE.LI_`
+  - `original/examples/dvxp.pk2`
+  - `original/examples/fontutil.pk2`
+  - `original/examples/os2drv.pk2`
 - `file(1)`/libmagic recognition of FTCOMP files.
 - Public usage-level PACK2/UNPACK2 documentation and examples.
 
@@ -22,6 +26,23 @@ The public `file(1)` magic database recognizes FTCOMP by:
 - Probable magic value `A5 96 FD FF` at offset `0`.
 - Original filename string at offset `0x29`.
 
+## OS/2 UNPACK2 Code Map
+
+The loaded OS/2 `UNPACK2.EXE` binary maps to the container-level documentation as follows. Function names are descriptive IDB names assigned during analysis.
+
+| Address | Function | File-format role |
+| ---: | --- | --- |
+| `0x000b40` | `process_archive_members(...)` | Main member-processing loop for list and extract operations. |
+| `0x002154` | `read_pack2_member_header(...)` | Reads the 0x29-byte fixed header and variable filename. |
+| `0x002314` | `validate_pack2_member_magic(...)` | Checks `magic0 == 0x96a5` and `magic1 == 0xfffd`. |
+| `0x002397` | `compute_pack2_payload_bounds(...)` | Chooses the primary payload end from `data_end_offset`, `next_member_offset`, or the final-member file-size rule. |
+| `0x002556` | `unpack_ftcomp_member(...)` | Sends an FTCOMP member payload through the FTCOMP decoder. |
+| `0x00282e` | `copy_stored_member(...)` | Copies a stored/non-FTCOMP member payload. |
+| `0x0040a9` | `extract_pack2_member_payload(...)` | Performs the member payload read/extract step. |
+| `0x00465e` | `scan_pack2_archive(...)` | Enumerates members by following absolute `next_member_offset` values. |
+
+This OS/2 binary confirms that the outer PACK2 container logic is separate from the FTCOMP payload decoder. The same member header fields drive both raw/stored extraction and FTCOMP extraction.
+
 ## Terminology
 
 PACK2 is used in two related forms:
@@ -29,7 +50,7 @@ PACK2 is used in two related forms:
 - A single compressed file, often named with a final underscore such as `USING.IN_`.
 - A bundle/archive containing one or more member records.
 
-The samples in `original/examples/` are single-member FTCOMP files. The same member header layout is used by `UNPACK2` when scanning bundles.
+The `*.??_` samples in `original/examples/` are single-member FTCOMP files. The `.pk2` samples are multi-member bundles. The same member header layout is used in both cases.
 
 ## Byte Order
 
@@ -66,13 +87,13 @@ struct pack2_member_header {
     uint16_t dos_time;            // DOS file time
     uint16_t file_attrs;          // DOS file attributes
     uint16_t reserved_0a;         // observed 0
-    uint32_t data_end_offset;     // inferred; 0 in current samples
+    uint32_t data_end_offset;     // absolute end of primary file-data stream, or 0
     uint32_t unpacked_size;       // original output size
     uint32_t next_member_offset;  // absolute offset of next member, or 0
     char     method[7];           // NUL-terminated, e.g. "FTCOMP"
     uint16_t method_arg0;         // method-specific; observed 0xcb2b/0x82ea
     uint16_t method_type;         // FTCOMP path requires 1
-    uint32_t method_arg1;         // observed 4
+    uint32_t method_arg1;         // method/auxiliary-data value; often 4
     uint16_t filename_len;        // bytes at offset 0x29, includes NUL
 };
 ```
@@ -87,13 +108,13 @@ Field table:
 | `0x06` | 2 | `dos_time` | DOS time passed to `_dos_setftime`. |
 | `0x08` | 2 | `file_attrs` | DOS file attributes passed to `_dos_setfileattr`. |
 | `0x0a` | 2 | `reserved_0a` | Observed zero. |
-| `0x0c` | 4 | `data_end_offset` | Inferred alternate absolute end offset for payload sizing. Zero in samples. |
+| `0x0c` | 4 | `data_end_offset` | Absolute end offset of the primary file-data payload when non-zero. |
 | `0x10` | 4 | `unpacked_size` | Original file size. Used by `/SIZES` and output open/allocation logic. |
 | `0x14` | 4 | `next_member_offset` | Absolute offset of next member. Zero for final member. |
 | `0x18` | 7 | `method` | NUL-terminated method string. `FTCOMP` in samples. |
 | `0x1f` | 2 | `method_arg0` | Unknown method-specific value. |
 | `0x21` | 2 | `method_type` | `UNPACK2` requires `1` for FTCOMP decompression. |
-| `0x23` | 4 | `method_arg1` | Unknown method-specific value; observed `4`. |
+| `0x23` | 4 | `method_arg1` | Method-specific value. Observed `4`, `0x31`, and `0x14d`; non-`4` values correlate with auxiliary metadata streams in current samples. |
 | `0x27` | 2 | `filename_len` | Filename byte length including trailing NUL. |
 | `0x29` | n | `filename` | Stored output path/name, NUL-terminated. |
 
@@ -125,7 +146,7 @@ The member payload begins at:
 payload_offset = 0x29 + filename_len
 ```
 
-For FTCOMP members, the first four payload bytes are a little-endian control/prefix value. In both samples:
+For FTCOMP members, the first four payload bytes are a little-endian control/prefix value. In all current FTCOMP samples:
 
 ```text
 80 60 00 00
@@ -147,13 +168,52 @@ The FTCOMP stream may start with:
 
 See [FTCOMP Compression Notes](ftcomp.md) for the payload decompression algorithm.
 
+## Primary and Auxiliary Payloads
+
+Each member has a primary FTCOMP payload that decompresses to the file bytes named by the member header. Some archive members also carry an auxiliary FTCOMP payload after the primary one. The new `.pk2` bundle samples show this pattern in OS/2 driver archives.
+
+When `data_end_offset == 0`, the primary payload runs to:
+
+- `next_member_offset`, for non-final members.
+- `file_size - 4`, for final members.
+
+When `data_end_offset != 0`, the primary payload runs only to `data_end_offset`. If there are bytes after that before the next member or final trailer, those bytes form an auxiliary FTCOMP stream. The auxiliary stream has the same 4-byte `80 60 00 00` prefix and then usually begins with `fT19`.
+
+Observed auxiliary streams contain OS/2 metadata-like records such as `.TYPE`, `.APP`, `.ICON`, and `CHECKSUM`. These are not part of the primary file content and should not be appended to the extracted file bytes.
+
+Examples:
+
+```text
+os2drv.pk2 member 0:
+  payload_offset       0x00003e
+  data_end_offset      0x0047c6
+  next_member_offset   0x004803
+  primary payload      [0x00003e, 0x0047c6)
+  auxiliary payload    [0x0047c6, 0x004803)
+
+dvxp.pk2 member 0:
+  payload_offset       0x00003e
+  data_end_offset      0x027a29
+  next_member_offset   0
+  primary payload      [0x00003e, 0x027a29)
+  auxiliary payload    [0x027a29, file_size - 4)
+```
+
+The `os2drv.pk2` auxiliary payload starts:
+
+```text
+80 60 00 00 66 54 31 39 ff ff 31 00 ...
+```
+
+That is a normal member-level FTCOMP prefix, an `fT19` tag, and a raw FTCOMP block of `0x31` bytes. The decoded bytes include OS/2 metadata records, not primary file data.
+
 ## Payload Size
 
-`UNPACK2` computes the number of bytes passed to the FTCOMP streaming layer from header offsets and current stream position.
+`UNPACK2` computes the number of bytes passed to the primary FTCOMP streaming layer from header offsets and current stream position. In the OS/2 binary this logic is concentrated in `compute_pack2_payload_bounds` at `0x002397`.
 
 Observed logic:
 
-1. If `data_end_offset != 0`, use it as the end offset.
+1. If `data_end_offset != 0`, use it as the primary file-data end offset.
 2. Else if `next_member_offset != 0`, use it as the end offset.
 3. Else use the physical file size as the end offset.
 
@@ -164,7 +224,7 @@ Then subtract:
 - the fixed header size,
 - and, in the final-member/file-size case, an additional 4-byte adjustment.
 
-For the single-member samples, the computed FTCOMP byte count excludes four trailing bytes from the physical file length and includes the 4-byte FTCOMP prefix.
+For final members without a following `next_member_offset`, the computed FTCOMP byte count excludes four trailing bytes from the physical file length and includes the 4-byte FTCOMP prefix.
 
 Practical implementation guidance:
 
@@ -178,18 +238,22 @@ else if (next_member_offset != 0)
 else
     payload_end = file_size - 4;       // final-member trailer adjustment
 
-payload_size = payload_end - payload_offset;
+primary_payload_size = payload_end - payload_offset;
 ```
 
-This formula matches the current single-member samples:
+This formula matches the current samples:
 
-| File | Size | `filename_len` | `payload_offset` | Effective `payload_end` | `payload_size` |
+| File/member | Size | `filename_len` | `payload_offset` | Primary payload end | Primary payload size |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `DUMMY.TX_` | 62 | 10 | 51 | 58 | 7 |
 | `USING.IN_` | 1739 | 10 | 51 | 1735 | 1684 |
 | `EVALUATE.LI_` | 487 | 13 | 54 | 483 | 429 |
+| `fontutil.pk2` / `BINCTRL.DLL` | 32114 | 12 | 53 | 3709 | 3656 |
+| `fontutil.pk2` / `radioa2.bmp` | 32114 | 12 | 31937 | 32110 | 173 |
+| `os2drv.pk2` / `\os2\dll\bvhsvga.dll` | 230665 | 21 | 62 | 18374 | 18312 |
+| `dvxp.pk2` / `\os2\dll\ibms332.dll` | 162574 | 21 | 62 | 162345 | 162283 |
 
-The four physical bytes after `payload_end` are currently not fully identified. In the samples they are present after the effective FTCOMP data region. Treat them as a final-member trailer until more multi-member samples are available.
+For final members, the four physical bytes after the final effective data region are still not fully identified. Treat them as a final-member trailer. If `data_end_offset != 0`, the final effective data region can include an auxiliary FTCOMP stream between `data_end_offset` and `file_size - 4`.
 
 ## End-of-Archive and Member Chaining
 
@@ -332,6 +396,53 @@ e0 9d 61 1e    compressed-block weight bytes
 
 This sample proves that listing a member and extracting stored/raw FTCOMP blocks is not sufficient for general PACK2 extraction. A complete reader must implement the FTCOMP compressed-block path described in [FTCOMP Compression Notes](ftcomp.md).
 
+### `original/examples/fontutil.pk2`
+
+`fontutil.pk2` is a 15-member bundle. All members use FTCOMP method type `1`, `data_end_offset == 0`, and absolute `next_member_offset` chaining. The final member ends at `file_size - 4`.
+
+Representative members:
+
+| Member | Offset | Name | Unpacked | Next | Payload | First block |
+| ---: | ---: | --- | ---: | ---: | ---: | --- |
+| 0 | `0x000000` | `BINCTRL.DLL` | 6176 | `0x000e7d` | 3656 | `target=0x11d4`, weights `01 01 01 01` |
+| 1 | `0x000e7d` | `BLKCRINK.BMP` | 20118 | `0x002470` | 5565 | `target=0x2542`, weights `5a 0e f0 a4` |
+| 10 | `0x00687b` | `OS2FS.EXE` | 7600 | `0x0078b4` | 4102 | `target=0x1400`, weights `ce af 4f 30` |
+| 14 | `0x007c8c` | `radioa2.bmp` | 406 | `0` | 173 | `target=0x00a6`, weights `01 01 01 01` |
+
+This bundle is useful for validating archive scanning because it mixes DLLs, BMPs, an EXE, and an INI file while keeping the primary payload-bound rule simple.
+
+### `original/examples/os2drv.pk2`
+
+`os2drv.pk2` is a 14-member bundle. It validates absolute `next_member_offset` chaining, stored names with leading OS/2 path separators, and non-zero `data_end_offset` handling.
+
+Representative members:
+
+| Member | Offset | Name | `data_end_offset` | Next | Primary payload | Auxiliary payload |
+| ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| 0 | `0x000000` | `\os2\dll\bvhsvga.dll` | `0x0047c6` | `0x004803` | 18312 | 61 |
+| 1 | `0x004803` | `\os2\mdos\vsvga.sys` | `0x0130fa` | `0x013137` | 59578 | 61 |
+| 3 | `0x0140eb` | `\os2\dll\s3pmi.dll` | `0x01bb9c` | `0x01bbd9` | 31349 | 61 |
+| 11 | `0x03193a` | `\os2\install\create.exe` | `0x035b04` | `0x035b41` | 16777 | 61 |
+| 13 | `0x03800f` | `\os2\help\s3help.hlp` | `0` | `0` | 1208 | 0 |
+
+The 61-byte auxiliary streams in this sample decode from an `fT19` raw block. Their plaintext includes metadata labels such as `.TYPE` and `.APP`. They are separate from the primary file output.
+
+### `original/examples/dvxp.pk2`
+
+`dvxp.pk2` is a single-member archive with a large primary payload and a larger auxiliary stream:
+
+```text
+name                 \os2\dll\ibms332.dll
+unpacked_size        362709
+payload_offset       0x00003e
+data_end_offset      0x027a29
+primary payload      162283 bytes
+auxiliary payload    225 bytes, ending at file_size - 4
+method_arg1          0x014d
+```
+
+The auxiliary stream starts with an `fT19` raw block of `0x00d5` bytes. Its decoded records include `.ICON` and `CHECKSUM`, so it is a useful sample for later auxiliary-metadata decoding.
+
 ## Minimal Parser Pseudocode
 
 ```c
@@ -366,6 +477,18 @@ parse_pack2_file(buf, file_size):
         if payload_end < payload_off || payload_end > file_size:
             error "bad payload bounds"
 
+        if h.next_member_offset != 0:
+            member_end = h.next_member_offset
+        else:
+            member_end = file_size - 4
+
+        if member_end < payload_end || member_end > file_size:
+            error "bad member bounds"
+
+        auxiliary_payload = empty
+        if h.data_end_offset != 0 && h.data_end_offset < member_end:
+            auxiliary_payload = buf[h.data_end_offset : member_end]
+
         members.append({
             name: name,
             method: h.method,
@@ -376,6 +499,8 @@ parse_pack2_file(buf, file_size):
             unpacked_size: h.unpacked_size,
             payload_offset: payload_off,
             payload_size: payload_end - payload_off,
+            auxiliary_payload_offset: h.data_end_offset if auxiliary_payload is not empty,
+            auxiliary_payload_size: len(auxiliary_payload),
         })
 
         if h.next_member_offset == 0:
@@ -408,6 +533,9 @@ extract_member(member):
     write output to member.name
     set DOS timestamp from member.dos_date/member.dos_time
     set DOS attributes from member.file_attrs
+
+    // If auxiliary_payload_size is non-zero, decode it separately as metadata.
+    // Do not append it to output.
 ```
 
 ## Confidence and Open Questions
@@ -420,16 +548,18 @@ High confidence:
 - Filename starts at `0x29`.
 - `filename_len` includes the trailing NUL.
 - `unpacked_size`, DOS date/time, attributes, and `next_member_offset` meanings are confirmed by IDA use.
-- FTCOMP payload begins with a 4-byte prefix before `fT19`/`fT21` or fallback bytes.
+- The primary FTCOMP payload begins with a 4-byte prefix before `fT19`/`fT21` or fallback bytes.
+- Multi-member bundles use absolute `next_member_offset` values from the start of the archive.
+- Non-zero `data_end_offset` marks the end of the primary file-data payload in the current `.pk2` samples.
+- Bytes between non-zero `data_end_offset` and the next member/final trailer are a separate FTCOMP stream and should be decoded separately from file content.
 
 Medium confidence:
 
-- `data_end_offset` at `0x0c` is an alternate payload/member end offset. It is used by `UNPACK2` before `next_member_offset` when non-zero, but the current samples do not exercise it.
 - Final-member payload sizing subtracts a 4-byte trailer from physical file size. Current samples match this behavior.
+- Auxiliary streams carry OS/2 extended attributes or installer metadata. The decoded records strongly suggest this, but the exact record grammar is not yet documented.
 
 Unknown:
 
 - Exact meaning of `method_arg0` at `0x1f`.
-- Exact meaning of `method_arg1` at `0x23`.
+- Exact meaning of `method_arg1` at `0x23`; values other than `4` correlate with auxiliary payloads but are not yet fully decoded.
 - Exact contents and purpose of the final 4-byte trailer in single-member files.
-- Whether all multi-member bundles use absolute offsets from file start for both `data_end_offset` and `next_member_offset`; IDA behavior strongly suggests this, but the current samples are single-member only.

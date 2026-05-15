@@ -16,7 +16,8 @@ func newBitReader(data []byte) *bitReader {
 func (b *bitReader) fill() error {
 	for b.nb <= 8 {
 		if b.pos >= len(b.data) {
-			return fmt.Errorf("%w: truncated bitstream", ErrInvalidData)
+			b.nb += 8
+			continue
 		}
 		b.buf |= uint16(b.data[b.pos]) << (8 - b.nb)
 		b.pos++

@@ -137,8 +137,8 @@ func decodeTagged(data []byte, version int) ([]byte, error) {
 			intermediateTarget: int(target),
 			literalWeightA:     data[0],
 			markerWeightA:      data[1],
-			literalWeightB:     data[2],
-			markerWeightB:      data[3],
+			markerWeightB:      data[2],
+			literalWeightB:     data[3],
 			bitstream:          data[4:],
 			version:            version,
 			bytesProduced:      len(out),
@@ -214,15 +214,18 @@ func decodeCompressedBlock(block compressedBlock) ([]byte, int, error) {
 			return nil, 0, err
 		}
 	}
-
-	intermediate, err := decodeIntermediate(br, tableA, tableB, block)
+	taggedSuffixTable, err := buildHuffTable(taggedWeights)
+	if err != nil {
+		return nil, 0, err
+	}
+	intermediate, err := decodeIntermediate(br, tableA, tableB, taggedSuffixTable, block)
 	if err != nil {
 		return nil, 0, err
 	}
 
-	out, err := expandMarkerStream(intermediate, block.version)
+	out, err := expandFramedIntermediate(intermediate, block.version)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("%w; intermediate prefix % x", err, intermediate[:min(len(intermediate), 16)])
 	}
 	if block.version == Version2 {
 		out, err = expandRLE(out)
@@ -231,6 +234,38 @@ func decodeCompressedBlock(block compressedBlock) ([]byte, int, error) {
 		}
 	}
 	return out, br.pos, nil
+}
+
+func expandFramedIntermediate(intermediate []byte, version int) ([]byte, error) {
+	var out []byte
+	for off := 0; off < len(intermediate); {
+		if len(intermediate)-off < 2 {
+			return nil, fmt.Errorf("%w: truncated intermediate segment header", ErrInvalidData)
+		}
+		segmentLen := int(binary.LittleEndian.Uint16(intermediate[off : off+2]))
+		headerOff := off
+		off += 2
+		if segmentLen == 0 {
+			return nil, fmt.Errorf("%w: empty intermediate segment", ErrInvalidData)
+		}
+		if segmentLen > len(intermediate)-off {
+			return nil, fmt.Errorf("%w: truncated intermediate segment at offset %d length %d remaining %d", ErrInvalidData, headerOff, segmentLen, len(intermediate)-off)
+		}
+
+		segment := intermediate[off : off+segmentLen]
+		off += segmentLen
+		if segment[0] == 0 {
+			out = append(out, segment[1:]...)
+			continue
+		}
+
+		expanded, err := expandMarkerStream(segment[1:], version)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, expanded...)
+	}
+	return out, nil
 }
 
 func buildAdaptiveTable(model []uint16, literalWeight, markerWeight byte) (*huffTable, error) {
@@ -298,13 +333,13 @@ func (m *mtfPair) decode(value int, version int) int {
 	return value
 }
 
-func decodeIntermediate(br *bitReader, tableA, tableB *huffTable, block compressedBlock) ([]byte, error) {
+func decodeIntermediate(br *bitReader, tableA, tableB, suffixTable *huffTable, block compressedBlock) ([]byte, error) {
 	out := make([]byte, 0, block.intermediateTarget)
 	var twoByteHistory history
 	var markerHistory history
 	twoByteCursor := 0x20
 	markerCursor := 0x20
-	var mtf [4]mtfPair
+	mtf := initialMTFState()
 	subState := 0
 	pendingState := 0
 	pendingRecord := -1
@@ -312,7 +347,7 @@ func decodeIntermediate(br *bitReader, tableA, tableB *huffTable, block compress
 
 	for len(out) < block.intermediateTarget {
 		if pendingState != 0 {
-			nextState, err := appendSuffix(br, tableB, &out, &mtf, pendingState, block.version, finalEstimate)
+			nextState, err := appendSuffix(br, suffixTable, &out, mtf, pendingState, block.version, finalEstimate)
 			if err != nil {
 				return nil, err
 			}
@@ -364,7 +399,7 @@ func decodeIntermediate(br *bitReader, tableA, tableB *huffTable, block compress
 		case sym <= 0x190:
 			distance := sym - 0x17f
 			if distance < 2 || distance > 17 || len(out) < distance {
-				return nil, fmt.Errorf("%w: invalid recent output pair", ErrInvalidData)
+				return nil, fmt.Errorf("%w: invalid recent output pair symbol 0x%x distance %d at intermediate offset %d input byte %d", ErrInvalidData, sym, distance, len(out), br.pos)
 			}
 			pair := uint16(out[len(out)-distance]) | uint16(out[len(out)-distance+1])<<8
 			out = append(out, byte(pair), byte(pair>>8))
@@ -436,7 +471,15 @@ func pairLengthEstimate(pair uint16) int {
 	return 2
 }
 
-func appendSuffix(br *bitReader, table *huffTable, out *[]byte, mtf *[4]mtfPair, state int, version int, finalEstimate int) (int, error) {
+func initialMTFState() []mtfPair {
+	mtf := make([]mtfPair, 4)
+	for i := range mtf {
+		mtf[i] = mtfPair{recent0: 0, recent1: 1}
+	}
+	return mtf
+}
+
+func appendSuffix(br *bitReader, table *huffTable, out *[]byte, mtf []mtfPair, state int, version int, finalEstimate int) (int, error) {
 	if state == 1 || state == 3 {
 		value, err := table.decode(br)
 		if err != nil {
@@ -580,7 +623,7 @@ func expandMarkerStream(src []byte, version int) ([]byte, error) {
 
 		copyFrom := len(dst) - distance - 1
 		if copyFrom < 0 {
-			return nil, fmt.Errorf("%w: invalid marker distance", ErrInvalidData)
+			return nil, fmt.Errorf("%w: invalid marker distance at marker offset %d length %d distance %d output %d", ErrInvalidData, i, length, distance, len(dst))
 		}
 		for range length {
 			dst = append(dst, dst[copyFrom])

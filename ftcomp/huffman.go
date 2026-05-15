@@ -2,7 +2,6 @@ package ftcomp
 
 import (
 	"fmt"
-	"sort"
 )
 
 const (
@@ -35,6 +34,7 @@ func buildHuffTable(weights []uint16) (*huffTable, error) {
 	t := &huffTable{}
 	queue := make([]uint16, 0, modelSymbolCount)
 	var lastZero uint16
+	oneCount := 0
 	for sym, weight := range weights {
 		id := uint16(sym * 4)
 		t.nodes[sym].weight = weight
@@ -43,6 +43,16 @@ func buildHuffTable(weights []uint16) (*huffTable, error) {
 		t.nodes[sym].child1 = 0
 		if weight == 0 {
 			lastZero = id
+			continue
+		}
+		if weight == 1 {
+			var displaced uint16
+			if oneCount < len(queue) {
+				displaced = queue[oneCount]
+			}
+			queue = append(queue, displaced)
+			queue[oneCount] = id
+			oneCount++
 			continue
 		}
 		queue = append(queue, id)
@@ -55,43 +65,65 @@ func buildHuffTable(weights []uint16) (*huffTable, error) {
 		queue = append(queue, lastZero)
 	}
 
-	sort.SliceStable(queue, func(i, j int) bool {
-		return t.nodes[queue[i]/4].weight < t.nodes[queue[j]/4].weight
-	})
+	sortQueueDOS(queue, oneCount, len(queue)-1, t)
 
 	nextInternal := uint16(internalNodeThreshold)
-	for len(queue) > 1 {
-		left := queue[0]
-		right := queue[1]
-		queue = queue[2:]
+	queueRead := 0
+	remaining := len(queue)
+	if len(queue) != 2 {
+		for {
+			remaining--
 
-		if int(nextInternal/4) >= len(t.nodes) {
-			return nil, fmt.Errorf("%w: Huffman tree too large", ErrInvalidData)
-		}
-		parent := nextInternal
-		nextInternal += 4
+			left := queue[queueRead]
+			right := queue[queueRead+1]
+			searchStart := queueRead + 2
+			queueRead++
+			parentWeight := t.nodes[left/4].weight + t.nodes[right/4].weight
 
-		p := &t.nodes[parent/4]
-		p.weight = t.nodes[left/4].weight + t.nodes[right/4].weight
-		p.parent = 0
-		p.child0 = left
-		p.child1 = right
-		t.nodes[left/4].parent = parent
-		t.nodes[right/4].parent = parent
+			insert := len(queue)
+			for i := searchStart; i < len(queue); i++ {
+				if t.nodes[queue[i]/4].weight >= parentWeight {
+					insert = i
+					break
+				}
+			}
 
-		insert := len(queue)
-		for i, id := range queue {
-			if t.nodes[id/4].weight >= p.weight {
-				insert = i
+			if int(nextInternal/4) >= len(t.nodes) {
+				return nil, fmt.Errorf("%w: Huffman tree too large", ErrInvalidData)
+			}
+			parent := nextInternal
+			copy(queue[queueRead:insert-1], queue[queueRead+1:insert])
+			queue[insert-1] = parent
+			nextInternal += 4
+
+			p := &t.nodes[parent/4]
+			p.weight = parentWeight
+			p.parent = 0
+			p.child0 = left
+			p.child1 = right
+			t.nodes[left/4].parent = parent
+			t.nodes[right/4].parent = parent
+
+			if remaining == 2 {
 				break
 			}
 		}
-		queue = append(queue, 0)
-		copy(queue[insert+1:], queue[insert:])
-		queue[insert] = parent
 	}
 
-	t.root = queue[0]
+	left := queue[queueRead]
+	right := queue[queueRead+1]
+	if int(nextInternal/4) >= len(t.nodes) {
+		return nil, fmt.Errorf("%w: Huffman tree too large", ErrInvalidData)
+	}
+	t.root = nextInternal
+	p := &t.nodes[t.root/4]
+	p.weight = t.nodes[left/4].weight + t.nodes[right/4].weight
+	p.parent = 0
+	p.child0 = left
+	p.child1 = right
+	t.nodes[left/4].parent = t.root
+	t.nodes[right/4].parent = t.root
+
 	for prefix := 0; prefix < fastSize; prefix++ {
 		bits := uint16(prefix << 7)
 		nbits := uint8(0)
@@ -110,6 +142,81 @@ func buildHuffTable(weights []uint16) (*huffTable, error) {
 	}
 
 	return t, nil
+}
+
+func sortQueueDOS(queue []uint16, first, last int, t *huffTable) {
+	if first >= last {
+		return
+	}
+
+	type span struct {
+		left  int
+		right int
+	}
+	stack := []span{{left: first, right: last}}
+	for len(stack) > 0 {
+		n := len(stack) - 1
+		left := stack[n].left
+		right := stack[n].right
+		stack = stack[:n]
+
+		for {
+			if right-left <= 16 {
+				insertionSortQueueDOS(queue, left, right, t)
+				break
+			}
+
+			i := left
+			j := right
+			pivot := t.nodes[queue[(left+right)/2]/4].weight
+			for {
+				for t.nodes[queue[i]/4].weight < pivot {
+					i++
+				}
+				for t.nodes[queue[j]/4].weight > pivot {
+					j--
+				}
+				if j >= i {
+					queue[i], queue[j] = queue[j], queue[i]
+					i++
+					j--
+				}
+				if j < i {
+					break
+				}
+			}
+
+			leftSize := j - left
+			rightSize := right - i
+			if rightSize > leftSize {
+				if i < right {
+					stack = append(stack, span{left: i, right: right})
+				}
+				right = j
+			} else {
+				if left < j {
+					stack = append(stack, span{left: left, right: j})
+				}
+				left = i
+			}
+			if left >= right {
+				break
+			}
+		}
+	}
+}
+
+func insertionSortQueueDOS(queue []uint16, left, right int, t *huffTable) {
+	for i := left + 1; i <= right; i++ {
+		key := queue[i]
+		keyWeight := t.nodes[key/4].weight
+		insert := left
+		for insert < i && t.nodes[queue[insert]/4].weight < keyWeight {
+			insert++
+		}
+		copy(queue[insert+1:i+1], queue[insert:i])
+		queue[insert] = key
+	}
 }
 
 func (t *huffTable) decode(br *bitReader) (int, error) {

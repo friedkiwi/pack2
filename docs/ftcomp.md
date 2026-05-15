@@ -5,6 +5,8 @@ This document describes the FTCOMP decompression algorithm used by IBM `UNPACK2`
 The notes are derived from:
 
 - The unpacked DOS `UNPACK2` binary in IDA Pro, especially the renamed `ftcomp_*` functions.
+- The OS/2 `UNPACK2` NE binary in IDA Pro. This independently confirms the unpack-side FTCOMP block decoder, Huffman builder, framed intermediate pass, and marker expansion path with different code and data addresses.
+- The OS/2 `PACK2` utility, which includes FTCOMP producer-side code and an embedded FTCOMP decode path used when handling existing packed inputs.
 - Public OS/2 references that identify `*.??_` files as IBM FTCOMP files unpacked by `UNPACK2`.
 - Public OS/2 PACK2/UNPACK2 usage examples.
 
@@ -38,13 +40,49 @@ The member is selected as FTCOMP when:
 - The member compression/name marker string compares case-insensitively equal to `FTCOMP`.
 - The associated member type/value checked by `UNPACK2` is `1`.
 
-IDA function:
-
-```text
-is_ftcomp_member
-```
+In the OS/2 binary, this selection happens in the member extraction path before dispatching to `unpack_ftcomp_member`. Older local labels for the DOS method check should be treated as tentative reverse-engineering names, not portable algorithm names.
 
 The member-level PACK2 container format is separate from FTCOMP. FTCOMP begins at the compressed member payload.
+
+## Implementation Address Maps
+
+The algorithm is shared by the DOS and OS/2 builds, but their addresses and DGROUP layouts are not. Treat addresses as reverse-engineering anchors only; clean implementations should use the byte-level structures and constants in this document.
+
+### OS/2 UNPACK2 Function Map
+
+The attached OS/2 `UNPACK2.EXE` IDB currently maps to these FTCOMP concepts:
+
+| Documentation concept | OS/2 function | Address | Notes |
+| --- | --- | ---: | --- |
+| Buffer/tag decode | `ftcomp_decompress_buffer` | `0x00a96e` | Checks `fT19`/`fT21`, raw fallback, block decode, and framed post-pass. |
+| Tagged-buffer wrapper | `ftcomp_decode_tagged_buffer` | `0x00a592` | Wrapper around the buffer-level decoder. |
+| Static/fixed initialization | `ftcomp_init_static_tables` | `0x00a714` | Initializes static and fixed decompressor tables. |
+| Raw/compressed block decode | `ftcomp_expand_block_to_buffer` | `0x0091aa` | Reads block marker/target, four weight bytes, model, adaptive tables, and first-stage intermediate bytes. |
+| Adaptive rebuild | `ftcomp_rebuild_adaptive_huffman_tables` | `0x008fe2` | Builds first and optional second adaptive tables from the decoded model. |
+| Huffman builder | `ftcomp_build_huffman_decode_tables` | `0x008cbe` | Builds tree nodes and 9-bit fast decode tables. |
+| Model sorter | `ftcomp_sort_model_symbols` | `0x008a7c` | Non-stable quicksort/insertion-sort helper for model symbols. |
+| Framed intermediate pass | `ftcomp_expand_framed_intermediate` | `0x00a69c` | Reads `uint16 segment_len` records from the intermediate stream. |
+| Segment expansion | `ftcomp_expand_segment_to_output` | `0x00a622` | Treats byte zero of each segment as the mode byte. |
+| Marker expansion | `ftcomp_expand_marker_stream` | `0x00993e` | Expands `0x9e` marker records. |
+| Far copy helper | `fast_fmemcpy` | `0x0078ee` | Signature is `fast_fmemcpy(len, src, dst)`. |
+
+### OS/2 UNPACK2 Data Anchors
+
+These are OS/2 implementation offsets observed in the loaded binary. They map to the same concepts as the DOS work-area table below, but should not be copied into a standalone decoder.
+
+| OS/2 address | Meaning |
+| ---: | --- |
+| `0x6002` | Huffman node work area used by the OS/2 builder. |
+| `0x7b32` | Queue/work area during table build and generated fast symbol table area. |
+| `0x7f32` | Generated fast bit-length table area. |
+| `0x06c4` | Internal-node threshold, shared algorithmically with the DOS build. |
+| `0x6d8c` | End of node scan in the OS/2 builder. |
+| `0xa262` | Per-block decoded model table target. |
+| `0xaa38` | Marker-record history area initialized at compressed-block start. |
+| `0xa5d6` | Two-byte history area initialized at compressed-block start. |
+| `0x0628` | Marker-history cursor, initialized to `0x20`. |
+| `0x062a` | Two-byte-history cursor, initialized to `0x20`. |
+| `0xa636` | Compressed input byte cursor; set to `6` after a compressed block header. |
 
 ## Stream Tags
 
@@ -62,10 +100,10 @@ Observed behavior:
 - If the current decompressor mode expects FTCOMP and the first four bytes do not match either tag, the buffer is treated as uncompressed.
 - For tagged streams, block decoding starts after the 4-byte tag.
 
-IDA function:
+Implementation anchor:
 
 ```text
-ftcomp_decompress_buffer
+DOS/OS2: ftcomp_decompress_buffer
 ```
 
 ## High-Level Pipeline
@@ -73,19 +111,20 @@ ftcomp_decompress_buffer
 For tagged compressed data, the decompressor performs these stages:
 
 1. Initialize static decode tables.
-2. Decode one FTCOMP block into an intermediate stream.
-3. Expand marker/back-reference records in the intermediate stream.
-4. For `fT21`, run an additional RLE-like expansion pass.
-5. Return the number of compressed bytes consumed and output bytes produced.
+2. Decode one FTCOMP block into a framed intermediate stream.
+3. Split the intermediate stream into marker-expansion segments.
+4. Expand marker/back-reference records in each segment, or copy stored segments directly.
+5. For `fT21`, run an additional RLE-like expansion pass.
+6. Return the number of compressed bytes consumed and output bytes produced.
 
 At the streaming API level, `UNPACK2` maintains pending output because one FTCOMP decode can produce more bytes than the caller requested.
 
-IDA functions:
+Implementation anchors:
 
 ```text
-ftcomp_begin_decode
-ftcomp_decode_chunk
-ftcomp_decompress_buffer
+DOS: ftcomp_begin_decode
+DOS: ftcomp_decode_chunk
+DOS/OS2: ftcomp_decompress_buffer
 ```
 
 ## Block Format
@@ -127,8 +166,8 @@ If `block_output_target < 0xffff`, the block is compressed:
 uint16 intermediate_target;
 uint8  literal_weight_a;
 uint8  marker_weight_a;
-uint8  literal_weight_b;
 uint8  marker_weight_b;
+uint8  literal_weight_b;
 uint8  bitstream[];
 ```
 
@@ -138,6 +177,16 @@ Observed field usage:
 - The four one-byte weight fields are used when rebuilding adaptive Huffman tables.
 - The bitstream starts at block offset `6`.
 - `compressed_bytes_consumed` is computed from the internal input cursor after decoding, plus the 4-byte stream tag at the top level.
+
+The OS/2 `UNPACK2` block decoder at `0x0091aa` confirms this layout directly. On the compressed path it stores:
+
+```text
+block byte +2 -> literal_weight_a
+block byte +3 -> marker_weight_a
+block byte +4 -> marker_weight_b
+block byte +5 -> literal_weight_b
+input cursor  -> 6
+```
 
 `original/examples/EVALUATE.LI_` exercises this path. After the PACK2 member prefix, its FTCOMP stream begins:
 
@@ -152,17 +201,42 @@ tag                   fT19
 intermediate_target   0x01e3 / 483 bytes
 literal_weight_a      0xe0
 marker_weight_a       0x9d
-literal_weight_b      0x61
-marker_weight_b       0x1e
+marker_weight_b       0x61
+literal_weight_b      0x1e
 final output size     683 bytes, from the PACK2 member header
 ```
 
 This is the first required negative test for incomplete readers: if a decoder accepts only raw blocks (`ff ff`) and rejects this sample with an error such as "compressed FTCOMP blocks are not implemented", the missing part is not the PACK2 container parser. The missing part is the compressed-block pipeline: model Huffman decode, adaptive table rebuild, main intermediate stream decode, and marker expansion.
 
-IDA function:
+The broader sample set now includes many `fT19` compressed blocks with both uniform and non-uniform block weight bytes:
+
+| Sample/member | First block target | Weight bytes |
+| --- | ---: | --- |
+| `USING.IN_` / `USING.INF` | `0x084f` | `dc ae 50 22` |
+| `EVALUATE.LI_` / `EVALUATE.LIC` | `0x01e3` | `e0 9d 61 1e` |
+| `fontutil.pk2` / `BINCTRL.DLL` | `0x11d4` | `01 01 01 01` |
+| `fontutil.pk2` / `BLKCRINK.BMP` | `0x2542` | `5a 0e f0 a4` |
+| `fontutil.pk2` / `OS2FS.EXE` | `0x1400` | `ce af 4f 30` |
+| `fontutil.pk2` / `radioa2.bmp` | `0x00a6` | `01 01 01 01` |
+| `os2drv.pk2` / `\os2\dll\bvhsvga.dll` | `0x46d0` | `01 01 01 01` |
+| `os2drv.pk2` / `\os2\MONITOR.DIF` | `0x066f` | `b8 54 aa 46` |
+| `os2drv.pk2` / `\os2\ddc.cmd` | `0x01d6` | `d5 95 69 29` |
+| `dvxp.pk2` / `\os2\dll\ibms332.dll` | `0x59a4` | `01 01 01 01` |
+
+This matters for implementation because many real members use the all-ones weighting case, but not all do. A decoder that only happens to work for `01 01 01 01` blocks is not complete. The non-uniform examples exercise the first-table and second-table adaptive rebuild paths described below.
+
+Some PACK2 auxiliary metadata streams also use FTCOMP. For example, `os2drv.pk2` stores a 61-byte auxiliary stream after selected primary payloads:
 
 ```text
-ftcomp_expand_block_to_buffer
+80 60 00 00 66 54 31 39 ff ff 31 00 ...
+```
+
+After the PACK2-level prefix, this is `fT19` followed by a raw block marker `0xffff` and byte count `0x0031`. These auxiliary streams decode separately from primary file data; see [PACK2 File Format Notes](pack2_file_format.md).
+
+Implementation anchor:
+
+```text
+DOS/OS2: ftcomp_expand_block_to_buffer
 ```
 
 ## Bit Order
@@ -228,17 +302,17 @@ There are multiple table families:
 - A dynamic/adaptive table rebuilt from the per-block model.
 - Saved table snapshots used for the second-level state-dependent decode path.
 
-IDA functions:
+Implementation anchors:
 
 ```text
-sort_model_symbols_by_weight
-build_huffman_decode_tables
-rebuild_adaptive_huffman_tables
+DOS: sort_model_symbols_by_weight
+DOS/OS2: build_huffman_decode_tables
+DOS/OS2: rebuild_adaptive_huffman_tables
 ```
 
 ### Table Work Areas
 
-The DOS implementation stores FTCOMP state in global data. The names below are descriptive; the addresses are the IDA offsets from `UNPACK2_unpacked.exe`.
+The DOS implementation stores FTCOMP state in global data. The names below are descriptive runtime offsets from the analyzed DOS implementation. OS/2 offsets for the same concepts are listed in [Implementation Address Maps](#implementation-address-maps).
 
 | Address | Size | Meaning |
 | --- | ---: | --- |
@@ -252,8 +326,8 @@ The DOS implementation stores FTCOMP state in global data. The names below are d
 | `0x870e` | `0x0060` | Recent two-byte literal/history table, 48 `uint16` slots. |
 | `0x13f2` | `0x0100` | Marker-control class table indexed by marker control byte. |
 | `0x14f2` | `0x01b1` | Symbol class table; non-zero symbols use the second adaptive table. |
-| `0x16a4` | `0x0400` | Static/model fast symbol table snapshot. |
-| `0x1aa4` | `0x0400` | Active adaptive fast symbol table snapshot used by suffix decodes. |
+| `0x16a4` | `0x0400` | Static/model seed weights at program load; later overwritten with a fast symbol table snapshot. |
+| `0x1aa4` | `0x0400` | Tagged-format suffix-decoder seed weights at program load; later overwritten with a fast symbol table snapshot. |
 | `0x2574` | `0x1588` | Static/model Huffman node snapshot. |
 | `0x3afc` | `0x1588` | Active adaptive Huffman node snapshot. |
 | `0x830e` | `0x0200` | Static/model fast bit-length table snapshot. |
@@ -282,7 +356,9 @@ byte_2C8CC = use_static_tables
 word_27A4C:len = far pointer to an alternate adaptive node snapshot area
 ```
 
-When `mode` requires generated static tables, it:
+There are two static initialization phases.
+
+The process-level initializer, `ftcomp_init_decompressor`, builds the model decoder used while reading each compressed block's 433-entry model. When `mode` requires generated static tables, it:
 
 1. Clears `huff_node[870]` at `0x528e`.
 2. Copies 433 initial static weights from `0x16a4` into `node[i].weight`.
@@ -294,6 +370,28 @@ When `mode` requires generated static tables, it:
 0x6dbe -> 0x16a4, length 0x0400
 0x71be -> 0x830e, length 0x0200
 ```
+
+The tag-level initializer in `ftcomp_decompress_buffer` runs when the stream switches into `fT19` or `fT21` mode. It builds the static suffix-decoder table set from the seed weights at `0x1aa4`:
+
+```text
+0x528e -> 0x3afc, length 0x1588
+0x6dbe -> 0x1aa4, length 0x0400
+0x71be -> 0x850e, length 0x0200
+```
+
+Do not treat runtime `0x1aa4` as already containing a fast table unless this tag-level initialization has run. In the original executable image, `0x1aa4` is another seed-weight array. After initialization it is overwritten with the generated fast symbol table.
+
+Do not use the generated `0x1aa4` table as the model decoder or the primary adaptive decoder. It is used by the pending-suffix paths after a marker control byte requests more bytes. The 433-entry block model is decoded with the static/model table generated from `0x16a4`; primary symbols after the model are decoded with the per-block adaptive tables.
+
+Important call-convention note: IDA's comments around `fast_fmemcpy` can be misleading. Both the DOS and OS/2 implementations consume stack arguments as:
+
+```c
+fast_fmemcpy(uint16_t len, void far *src, void far *dst);
+```
+
+So the assembly sequence that pushes `dst`, then `src`, then `len` is copying `src -> dst`, even if IDA labels the pushes differently.
+
+The OS/2 function at `0x0078ee` makes this explicit: it loads `len` into `cx`, loads `src` through `lds si`, loads `dst` through `les di`, copies with string operations, and returns with `retf 0x0a`.
 
 `ftcomp_init_static_tables` then resets the decompression byte counter and initializes fixed lookup tables:
 
@@ -307,24 +405,107 @@ When `mode` requires generated static tables, it:
 - It stores the selected static table pointer in `word_27A6E`.
 - It records the initialized mode in `byte_2F8DA`.
 
-For a clean implementation, these fixed arrays are constants from `UNPACK2`. They are not derived from the compressed input. The generated static/model Huffman tables can be reproduced from the 433 static weights and the table-builder below.
+For a clean implementation, these fixed arrays are constants. They are not derived from the compressed input. The generated static/model Huffman tables can be reproduced from the 433 static weights and the table-builder below.
 
-In the unpacked DOS executable, the initialized DGROUP data used by these offsets is present in `original/dos/UNPACK2_unpacked.exe` at:
+The `fT19` sample `EVALUATE.LI_` needs both generated static table sets: the `0x16a4` seed set for model decode and the `0x1aa4` seed set for pending suffix decode. The required standalone constants are included in [Standalone Constants](#standalone-constants).
+
+### Standalone Constants
+
+The following constants are sufficient to seed the `fT19` compressed path from this document alone. Hex strings are byte streams. Weight arrays are little-endian `uint16` values and contain 433 entries after decoding.
 
 ```text
-file_offset = dgroup_offset + 0x17840
+marker_control_class[256] =
+0101010101010101010101010101010101010101010101010101010101010101
+0101010101010101010101010101010101010101010101010101010101010101
+0002020202020202020202020202020202020202020202020202020202020202
+0202020202020202020202020202020202020202020202020202020202020202
+0300000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
 ```
 
-Constants needed for the `fT19` compressed path can therefore be extracted from:
+```text
+symbol_class[433] =
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000101010101010101010101010101010101010101010101010101
+0101010101010101010101010101010101010101010101010101010101010101
+0101010101010001010101010101010101010101010101010101010101010101
+0101010101010101010101010101010101010101010101010101010101010101
+0101010101010100000000000000000000000000000000000000000000000000
+0000000000000001010101010101010101
+```
 
-| Runtime offset | File offset | Size | Contents |
-| --- | ---: | ---: | --- |
-| `0x13f2` | `0x18c32` | `0x0100` | Marker-control class table. |
-| `0x14f2` | `0x18d32` | `0x01b1` | Symbol class table. |
-| `0x16a4` | `0x18ee4` | `0x0362` | Initial static/model Huffman weights, 433 `uint16` values. |
-| `0x0438` | `0x17c78` | `0x0fba` | Fixed static table block copied to `0xc024` by `ftcomp_init_static_tables`. |
+```text
+static_model_seed_weights_le16[433] =
+000458022c010401e600d400c000ac009400840078006c005c00540050004c00
+4800440040003c003800340030002c002800240020001c001800160014001300
+1200110010000f000e000e000d000d000c000c000b000b000a000a0009000900
+0900080008000800070007000700060006000600060005000500050005000400
+0400040004000400040003000300030003000300020002000200020002000200
+0200020001000100010001000100010001000100010001000100010001000100
+0100010001000100010001000100010001000100010001000100010001000100
+0100010001000100010001000100010001000100010001000100010001000100
+0100010001000100010001000100010001000100010001000100010001000100
+0100010001000100010001000100010001000100010001000100010001000100
+0100010001000100010001000100010001000100010001000100010001000100
+0100010001000100010001000100010001000100010001000100010001000100
+0100010001000100010001000100010001000100010001000100010001000100
+0100010001000100010001000100010001000100010001000100010001000100
+0100010001000100010001000100010001000100010001000100010001000100
+0100010001000100010001000100010001000100010001000100010001000400
+0f00000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000
+```
 
-The `fT19` sample `EVALUATE.LI_` needs the first three rows. The `0x0438` block is part of the original runtime state setup; keep it when cloning the DOS implementation's table layout exactly.
+```text
+tagged_model_seed_weights_le16[433] =
+2800270027002600260025002500240024002300230022002200210021002000
+20001f001f001e001e001d001d001c001c001b001a0019001800180017001700
+1600160015001500140014001300130013001200120012001100110011001100
+10001000100010001000100010000f000f000f000f000f000f000f000f000e00
+0e000e000e000e000e000d000d000d000d000d000d000c000c000c000c000c00
+0b000b000b000b000b000a000a000a000a000a000a0009000900090009000900
+0900090009000900090009000900090009000900090009000900090009000900
+0800080008000800080008000800080008000800080008000800080008000800
+0700070007000700070007000700070007000700070007000700070007000700
+0600060006000600060006000600060006000600060006000600060006000600
+0600060006000600060006000600050005000500050005000500050005000500
+0500050005000500050005000500050005000500050005000500050005000500
+0500050005000500050005000500050005000500050005000500050005000500
+0500050005000500050005000500050005000500040004000400040004000400
+0400040004000400040004000400040004000400040004000400040004000400
+0400040004000400040004000400040004000400040004000500070007000700
+ff00000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000
+```
 
 ### Generic Huffman Table Builder
 
@@ -334,58 +515,121 @@ The `fT19` sample `EVALUATE.LI_` needs the first three rows. The `0x0438` block 
 - A 512-entry fast symbol table.
 - A 512-entry fast bit-length table.
 
-The builder treats zero weights as absent symbols. Non-zero leaves are inserted into a sorted queue keyed by `weight`; ties preserve the existing order in the queue.
+The builder treats zero weights as absent symbols. Its initial queue construction has an important special case for weight `1` symbols.
+
+During the scan over 433 leaves:
+
+- `parent` is cleared for every leaf.
+- zero-weight leaves are omitted and the most recent zero leaf is remembered.
+- weight-1 leaves are inserted into the front portion of the queue.
+- weights greater than 1 are appended after the weight-1 region and sorted later.
+
+The weight-1 insertion is not equivalent to collecting all non-zero leaves and stable-sorting them. It uses the queue array itself:
+
+```c
+queue_len = 0;
+one_count = 0;
+
+for symbol = 0; symbol < 0x1b1; symbol++ {
+    node_id = symbol * 4;
+    node[symbol].parent = 0;
+
+    if (node[symbol].weight == 0) {
+        last_zero_node = node_id;
+        continue;
+    }
+
+    if (node[symbol].weight == 1) {
+        displaced = queue[one_count];
+        queue[queue_len++] = displaced;
+        queue[one_count++] = node_id;
+        continue;
+    }
+
+    queue[queue_len++] = node_id;
+}
+```
+
+After this scan, only `queue[one_count..queue_len-1]` is sorted by weight. The weight-1 prefix `queue[0..one_count-1]` is already in final order. This detail affects Huffman tie ordering and therefore the decoded bitstream.
+
+The DOS sorter is not stable. It is a non-recursive quicksort with insertion sort for partitions of 16 entries or fewer:
+
+- The quicksort partition compares only weights.
+- It advances the left side while `weight < pivot`.
+- It advances the right side while `weight > pivot`.
+- Equal-weight entries can be swapped when the two scans meet.
+- The insertion-sort fallback inserts the current entry before the first entry whose weight is greater than or equal to the current weight.
+
+Do not replace this with a stable sort. Stable ordering gives different tie resolution for equal-weight symbols and can produce a different Huffman tree.
 
 Special case: if there is only one non-zero symbol, the builder adds the last zero-weight symbol as a synthetic second leaf with weight `1`.
 
 Implementation-level outline:
 
 ```c
-// Gather leaves.
-queue = []
-last_zero_node = 0
-for symbol = 0; symbol < 0x1b1; symbol++ {
-    node_id = symbol * 4
-    node[symbol].parent = 0
-
-    if node[symbol].weight == 0 {
-        last_zero_node = node_id
-        continue
-    }
-
-    queue.push(node_id)
-}
-
-if len(queue) == 1 {
+if queue_len == 1 {
     node[last_zero_node / 4].weight = 1
-    queue.push(last_zero_node)
+    queue[queue_len++] = last_zero_node
 }
 
-stable_sort_by_weight(queue)
+sort_queue_dos_order(queue[one_count:queue_len])
 
 next_internal = 0x06c4
-while len(queue) > 1 {
-    left = queue.pop_front()
-    right = queue.pop_front()
+queue_read = 0
+remaining = queue_len
 
-    parent = next_internal
-    next_internal += 4
+if queue_len != 2 {
+    while true {
+        remaining--
 
-    node[parent / 4].weight = node[left / 4].weight + node[right / 4].weight
-    node[parent / 4].parent = 0
-    node[parent / 4].child0 = left
-    node[parent / 4].child1 = right
-    node[left / 4].parent = parent
-    node[right / 4].parent = parent
+        left = queue[queue_read]
+        right = queue[queue_read + 1]
+        search_start = queue_read + 2
+        queue_read++
 
-    insert parent back into queue before the first entry whose weight is
-    greater than or equal to node[parent].weight
+        parent_weight = node[left / 4].weight + node[right / 4].weight
+
+        // Find the first remaining queue entry whose weight is greater than
+        // or equal to the parent weight. The search window is
+        // queue[search_start:queue_len].
+        insert = lower_bound_by_weight(queue, search_start, queue_len, parent_weight)
+
+        // DOS uses fast_fmemcpy to move queue[queue_read + 1:insert] down by
+        // one slot, then writes the parent into queue[insert - 1].
+        memmove(&queue[queue_read],
+                &queue[queue_read + 1],
+                (insert - 1 - queue_read) * sizeof(uint16))
+
+        parent = next_internal
+        queue[insert - 1] = parent
+        next_internal += 4
+
+        node[parent / 4].weight = parent_weight
+        node[parent / 4].parent = 0
+        node[parent / 4].child0 = left
+        node[parent / 4].child1 = right
+        node[left / 4].parent = parent
+        node[right / 4].parent = parent
+
+        if remaining == 2
+            break
+    }
 }
 
-root = queue[0]
+left = queue[queue_read]
+right = queue[queue_read + 1]
+root = next_internal
+node[root / 4].weight = node[left / 4].weight + node[right / 4].weight
+node[root / 4].parent = 0
+node[root / 4].child0 = left
+node[root / 4].child1 = right
+node[left / 4].parent = root
+node[right / 4].parent = root
 word_2F8D6 = root
 word_2F8D8 = 0
 ```
+
+This is not a normal priority queue and not equivalent to repeatedly popping two entries from a slice and reinserting the parent into the shortened slice. The DOS builder keeps the queue array length fixed, treats `queue_read` as the front of the live window, consumes only one slot per merge, and overlays the generated parent into the slot before the lower-bound insertion point. That mutation order affects ties among generated internal nodes and can change the compressed bitstream immediately.
 
 After the tree is built, the DOS implementation fills the 9-bit fast tables when the active global table mode requests generated fast tables. Otherwise the same table shape is supplied from the prebuilt static snapshots.
 
@@ -460,12 +704,16 @@ The generated first table is saved:
 0x71be -> 0x77be, length 0x0200
 ```
 
-If the second pair of block weight bytes is identical to the first pair, or if both second-pair bytes are zero, the first table is reused. Otherwise the second adaptive table is built the same way using:
+If the second pair of block weight bytes is identical to the first pair, or if both second-pair bytes are zero, the first table is reused. Otherwise the second adaptive table is built the same way, but the second pair is stored in marker/literal order:
 
 ```text
-literal_weight_b = block byte +4
-marker_weight_b  = block byte +5
+marker_weight_b  = block byte +4
+literal_weight_b = block byte +5
 ```
+
+This ordering is easy to get wrong because the first pair is literal/marker while the second pair is marker/literal. In the DOS rebuild routine, the first table uses byte `+2` for `symbol_class == 0` and byte `+3` for `symbol_class != 0`; the second table uses byte `+5` for `symbol_class == 0` and byte `+4` for `symbol_class != 0`.
+
+The OS/2 `UNPACK2` binary and the OS/2 `PACK2` utility contain the same FTCOMP decode-side rebuild sequence: they read compressed block bytes `+2`, `+3`, `+4`, and `+5` into four globals, then apply the first pair as literal/marker and the second pair as marker/literal when rebuilding the two adaptive tables. This independently confirms the byte order above.
 
 The second generated table remains in the active work areas:
 
@@ -504,6 +752,8 @@ rebuild_adaptive_huffman_tables(model, block_weight_fields);
 
 The zero-run symbol always emits exactly 16 zero model entries unless fewer than 16 entries remain in the 433-entry model.
 
+For `fT19`, this model decode uses the process-level static/model table generated from the `0x16a4` seed weights. The separate tag-level table generated from `0x1aa4` is used later for pending suffix symbols, not for this 433-symbol model decode.
+
 The adaptive table rebuild multiplies non-zero model entries by one of two weight bytes. Which weight byte is used depends on an auxiliary symbol-class table. `fT21` has two sets of weight bytes; if both sets are equal or the second set is zero, it reuses the first generated table.
 
 Implementation guidance:
@@ -514,9 +764,50 @@ Implementation guidance:
 
 ## Main Intermediate Stream Decode
 
-After the model has been decoded and adaptive tables rebuilt, the block bitstream produces an intermediate stream. The loop runs until `intermediate_target` bytes have been written.
+After the model has been decoded and adaptive tables rebuilt, the block bitstream produces a framed intermediate stream. The loop runs until `intermediate_target` bytes have been written.
 
-The intermediate stream contains literal bytes and `0x9e` marker records. It is not the final output. It is later passed to marker expansion.
+The intermediate stream is not passed to marker expansion as one flat byte slice. It is a sequence of framed segments:
+
+```text
+uint16 segment_len;       // little-endian, number of bytes following
+uint8  segment_mode;      // included in segment_len
+uint8  segment_data[segment_len - 1];
+```
+
+`UNPACK2` consumes exactly `2 + segment_len` bytes per segment until the block's `intermediate_target` byte count is exhausted.
+
+Segment behavior:
+
+```c
+while intermediate bytes remain:
+    segment_len = read_le16(p);
+    p += 2;
+
+    segment = p[0:segment_len];
+    p += segment_len;
+
+    if segment[0] == 0:
+        append segment[1:] directly to block output;
+    else:
+        append expand_marker_stream(segment[1:]) to block output;
+```
+
+This framing is important. If a decoder feeds the whole `intermediate_target` bytes directly to the marker expander, the segment length and mode bytes will be misinterpreted as compressed marker data. `EVALUATE.LI_` then fails early with a bogus back-reference such as "marker offset 3 length 52 distance 97 output 0". That error means the segment framing was skipped or the segment boundary is wrong, not that a valid marker may copy before the start of output.
+
+The OS/2 `UNPACK2` binary has the same framing post-pass: after the first-stage block expansion, `ftcomp_expand_framed_intermediate` repeatedly reads a little-endian `uint16` length, copies exactly that many bytes to a temporary buffer, and calls `ftcomp_expand_segment_to_output`. The segment expander decrements the length by one and treats byte zero as the mode flag before either copying the segment data or calling `ftcomp_expand_marker_stream`.
+
+The OS/2 `PACK2` utility's embedded decode path follows the same structure, which gives a second confirmation that framing is part of FTCOMP itself rather than an artifact of one executable.
+
+If segment framing is implemented but the first `segment_len` is larger than the remaining intermediate buffer, the mismatch is earlier than marker expansion. For `EVALUATE.LI_`, errors such as `truncated intermediate segment at offset 0 length 31224 remaining 481`, `truncated intermediate segment at offset 0 length 51192 remaining 481`, or `truncated intermediate segment at offset 0 length 36088 remaining 481` mean the first two intermediate bytes were generated incorrectly. The most likely causes are:
+
+- using the primary adaptive table for pending suffix symbols instead of the generated `0x1aa4` suffix table,
+- trying to use the generated `0x1aa4` suffix table as the model decoder or primary decoder,
+- skipping the tag-level static table initialization after seeing `fT19`,
+- copying the generated Huffman tables in the wrong direction because of misleading `fast_fmemcpy` argument comments,
+- diverging from the exact in-place `build_huffman_decode_tables` merge loop. In particular, a builder that repeatedly removes two queue entries and reinserts one parent is not equivalent to the DOS queue mutation order documented above,
+- or using stable sorting for equal-weight Huffman leaves. The DOS sorter is not stable; changing only this ordering has been observed to change the `EVALUATE.LI_` intermediate prefix.
+
+Within a marker-expanded segment, `segment_data` contains literal bytes and `0x9e` marker records.
 
 Important marker byte:
 
@@ -680,7 +971,7 @@ if ((bitbuf & 0x8000) == 0) {
 
 There is a version-2 special case after control byte `0x40`: it sets a flag and uses a 2-bit prefix instead of the normal prefix tree.
 
-After the raw prefix, the decoder reads one adaptive Huffman symbol and applies a small move-to-front transform. Symbols `0x100` and, for `fT21`, `0x101`, mean "reuse the most recent" and "reuse the second-most-recent" value for the current suffix class. Other values are adjusted upward so the aliases do not consume code space:
+After the raw prefix, the decoder reads one symbol from the tag-level static suffix table generated from the `0x1aa4` seed weights. It does not use the per-block adaptive primary tables for this step. Symbols `0x100` and, for `fT21`, `0x101`, mean "reuse the most recent" and "reuse the second-most-recent" value for the current suffix class. Other values are adjusted upward so the aliases do not consume code space:
 
 ```c
 decode_mtf(value, recent0, recent1):
@@ -709,6 +1000,15 @@ The DOS code has separate `recent0/recent1` pairs for:
 - Suffix class 1.
 - Suffix class 2.
 - The version-2 special six-symbol rolling state.
+
+All of these pairs are initialized as:
+
+```text
+recent0 = 0
+recent1 = 1
+```
+
+Do not initialize them to space or `0xff`; those values come from unrelated fixed buffers in the decompressor state and will corrupt marker suffix bytes.
 
 ### Suffix Word Encoding
 
@@ -741,7 +1041,7 @@ emit high_byte(word);
 pending_state = 0;
 ```
 
-For the direct literal-byte suffix state, the decoded value is emitted as one byte and the literal recent-value history is updated.
+For the direct literal-byte suffix state, the decoded value also comes from the generated `0x1aa4` suffix table. The decoded value is emitted as one byte and the literal recent-value history is updated.
 
 ### Two-Byte History
 
@@ -831,16 +1131,29 @@ The estimate is used only to adjust distance-code thresholds while decoding the 
 
 ## Marker Expansion
 
-The marker expansion pass converts the intermediate `0x9e` records into final bytes.
+The marker expansion pass converts one intermediate segment's `0x9e` records into final bytes. It operates on `segment_data`, not on the full framed intermediate block.
 
-IDA functions:
+Implementation anchors:
 
 ```text
-ftcomp_expand_marker_runs
-ftcomp_expand_marker_stream
+DOS: ftcomp_expand_marker_runs
+OS/2: ftcomp_expand_segment_to_output
+DOS/OS2: ftcomp_expand_marker_stream
 ```
 
-The inner marker-stream format is clear.
+The segment-level wrapper receives a single segment including its one-byte mode flag:
+
+```c
+expand_segment(segment):
+    segment_len = len(segment);
+
+    if segment[0] == 0:
+        return segment[1:segment_len];
+
+    return ftcomp_expand_marker_stream(segment[1:segment_len]);
+```
+
+`ftcomp_expand_marker_stream` expands only the bytes after the mode flag.
 
 Marker byte:
 
@@ -895,14 +1208,16 @@ Distance is therefore encoded as "distance minus one" in the stream.
 
 This pass is LZSS-like and must allow overlap during the copy.
 
+The destination is the current block-output window. A marker back-reference must resolve against bytes already emitted for the current segment/output window. A back-reference that points before the start of output is invalid; in practice, seeing that at marker offset `3` in `EVALUATE.LI_` indicates the segment frame was not stripped before marker expansion.
+
 ## Version-2 RLE Pass
 
 For `fT21`, after marker expansion, `UNPACK2` runs an additional RLE-like pass.
 
-IDA function:
+Implementation anchor:
 
 ```text
-ftcomp_expand_rle_runs
+DOS: ftcomp_expand_rle_runs
 ```
 
 The pass begins by reading the first byte from the post-marker stream:
@@ -985,8 +1300,13 @@ ftcomp_decode_stream
        else:
            decode model
            rebuild Huffman tables
-           decode intermediate stream
-           expand 0x9e marker records
+           decode framed intermediate stream
+           for each intermediate segment:
+               read uint16 segment_len
+               if segment[0] == 0:
+                   append segment[1:] directly
+               else:
+                   expand 0x9e marker records from segment[1:]
            if fT21:
                apply RLE pass
            append output
@@ -1009,12 +1329,16 @@ Validation strategy:
 2. Add tests for raw FTCOMP blocks.
 3. Add tests for `fT19` and `fT21` tag detection.
 4. Add `original/examples/EVALUATE.LI_` as a compressed `fT19` fixture. The first block has intermediate target `0x01e3` and must expand to the member header's 683-byte final output.
-5. Compare full decompression output against IBM `UNPACK2` for known PACK2/FTCOMP samples.
-6. Add trace logging for:
+5. Add at least one all-ones weighted block fixture, such as `fontutil.pk2` / `BINCTRL.DLL` or `os2drv.pk2` / `\os2\dll\bvhsvga.dll`.
+6. Add at least one non-uniform weighted block fixture with a larger output, such as `fontutil.pk2` / `OS2FS.EXE` or `os2drv.pk2` / `\os2\MONITOR.DIF`.
+7. Add an auxiliary-stream raw-block fixture from `os2drv.pk2` or `dvxp.pk2`; it should decode as metadata and must not be appended to primary file output.
+8. Compare full decompression output against IBM `UNPACK2` for known PACK2/FTCOMP samples.
+9. Add trace logging for:
    - block start offset
    - block type
    - compressed bytes consumed
    - intermediate bytes produced
+   - intermediate segment lengths and mode bytes
    - marker-expanded bytes produced
    - final bytes produced
 
@@ -1022,9 +1346,8 @@ Validation strategy:
 
 These items are not yet fully confirmed:
 
-- The semantic names of the four compressed-block weight bytes.
 - The exact field name for `intermediate_target`; behavior says it bounds the first-stage intermediate output.
-- The fixed static tables should be transcribed into source form before implementing a standalone decoder. The docs identify their IDA locations and usage, but do not inline the full constant byte arrays.
+- The remaining `EVALUATE.LI_` mismatch is still before marker expansion. With the documented second-pair weight order, MTF initialization, non-stable sorter, and in-place merge loop applied, the current generated intermediate prefix is `f8 8c 9e f8 0e 9e 2c 03 88 55 07 47 9e 74 ac 03`, which still decodes as an invalid first segment length. The next area to verify is exact static/model table construction against a trace from either the DOS implementation or the OS/2 `ftcomp_expand_block_to_buffer` path at `0x0091aa`.
 - The exact version-2 RLE side-stream split field name and all edge cases.
 
 The `EVALUATE.LI_` test case is `fT19`, so it does not require the version-2 RLE pass.
